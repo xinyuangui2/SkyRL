@@ -952,6 +952,9 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         "HF_TOKEN",
         "HF_HUB_OFFLINE",
         "HF_ENDPOINT",
+        # wandb run location: keys that can only write to a non-default team need the entity on the worker too.
+        "WANDB_ENTITY",
+        "WANDB_BASE_URL",
         "PYTORCH_CUDA_ALLOC_CONF",
         # Debug/trace knobs — forwarded so they reach the worker actors, not just the driver.
         "CUDA_LAUNCH_BLOCKING",

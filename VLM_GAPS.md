@@ -48,3 +48,16 @@ Format: one entry per gap — symptom, where, proposed fix, status.
 - **Proposed fix:** have `TensorList` accept `None` or zero-size entries (e.g. an empty
   `[0, dim]` tensor with a `[0, 3]` grid) and skip them when concatenating. Add a unit test with a mixed batch.
 - **Status:** open (proposal).
+
+## 5. `WANDB_ENTITY` isn't forwarded to Ray workers
+- **Symptom:** `wandb.errors.errors.CommError: the provided API key cannot access this resource`
+  at `Tracking.__init__`. The key's default entity (`anyscale-llm-forge`) isn't writable by it. The
+  only entity it can write to is a team (`sky-posttraining-uc-berkeley`), but setting `WANDB_ENTITY`
+  in the launching shell had no effect: `prepare_runtime_environment` forwards `WANDB_API_KEY` and
+  an allowlist of vars, and `WANDB_ENTITY` wasn't on that list. The tracker runs inside the Ray
+  task, so it never saw the entity.
+- **Where:** `skyrl/train/utils/utils.py` (`prepare_runtime_environment` forward list).
+  Not VLM-specific.
+- **Fix (minimal, in this branch):** add `WANDB_ENTITY` and `WANDB_BASE_URL` to the forwarded env vars.
+  Longer term: a `trainer.wandb_entity` config field, or forward all `WANDB_*` like `SKYRL_*`.
+- **Status:** fixed on branch.
