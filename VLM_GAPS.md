@@ -14,7 +14,12 @@ Format: one entry per gap — symptom, where, proposed fix, status.
   `examples/train/geometry3k/run_geometry3k.sh`, `run_geometry3k_lora.sh`,
   `docs/content/docs/examples/geometry3k.mdx`.
 - **Fix:** drop the override note once a stock run is confirmed.
-- **Status:** pending verification on 8xH100.
+- **Verification (2026-09-24, 8xH100 80GB, driver 580.178.04 / CUDA 13.0):** the pyproject pin is
+  `vllm==0.30.0`, and `uv run --isolated --extra fsdp` installs vllm 0.30.0, torch 2.13.0+cu130 and
+  transformers 5.16.1. The stock `run_geometry3k.sh` (no `[tool.uv.sources]` override) completes eval_before_train
+  and 10+ training steps with the VLM generator.
+- **Status:** verified. The override notes are removed from `vision_language_rl.mdx`,
+  `geometry3k.mdx`, `visgym.mdx` and both geometry3k run scripts on this branch.
 
 ## 2. Recipe assumes the driver and GPU workers share `$HOME` (multi-node Ray)
 - **Symptom:** on a cluster with a CPU-only head and a GPU worker (e.g. Anyscale), the run fails with
@@ -61,3 +66,59 @@ Format: one entry per gap — symptom, where, proposed fix, status.
 - **Fix (minimal, in this branch):** add `WANDB_ENTITY` and `WANDB_BASE_URL` to the forwarded env vars.
   Longer term: a `trainer.wandb_entity` config field, or forward all `WANDB_*` like `SKYRL_*`.
 - **Status:** fixed on branch.
+
+## 6. Checkpointing dominates checkpoint steps (165 s per save)
+- **Symptom:** with `ckpt_interval=5`, step 5 took 259 s against about 95 s for a normal step:
+  105 s eval plus 165 s `save_checkpoints` (FSDP policy with optimizer state, 8B, written to
+  `/mnt/cluster_storage`). That's roughly 2x wall-clock overhead amortized over 5 steps.
+- **Where:** `run_geometry3k.sh` (`trainer.ckpt_interval=5`, `eval_interval=5`). Not VLM-specific.
+- **Proposed fix:** default the recipe to a larger `ckpt_interval` (e.g. 20) or `max_ckpts_to_keep`,
+  and note that shared/NFS storage is slow for full optimizer checkpoints.
+- **Status:** open (recipe tuning).
+
+## 7. Eval metrics only reach the tracker, and the per-dataset key is `unknown`
+- **Symptom:** eval accuracy never appears in the console log, only in wandb and
+  `dumped_evals/*/aggregated_results.jsonl`. The per-dataset keys are `eval/unknown/*` because
+  `geometry_3k_dataset.py` doesn't set `data_source` on its records.
+- **Where:** `examples/train/geometry3k/geometry_3k_dataset.py` (record schema),
+  `skyrl/train/evaluate.py` (no console summary).
+- **Proposed fix:** add `data_source: "geometry3k"` to the dataset records, and log a one-line
+  `eval/all/pass_at_1` summary to the console after `log_eval_results`.
+- **Status:** open (small).
+
+## 8. transformers v5 `mm_token_type_ids` workaround: the comment is stale and the fix is image-only
+- **Symptom:** `model_wrapper.py:385-390` builds `mm_token_type_ids = (seq == config.image_token_id)`
+  because "vLLM doesn't support transformers v5 yet". The installed stack is now vllm 0.30.0 plus
+  transformers 5.16.1, so the rationale is out of date. The workaround also assumes images only
+  (no video tokens) and that the config has `image_token_id`.
+- **Where:** `skyrl/backends/skyrl_train/workers/model_wrapper.py:380-403`. The same 3D-position
+  skipping (`position_ids=None`) appears in `megatron_model_wrapper.py:489`.
+- **Proposed fix:** check whether vLLM's render endpoint now returns `mm_token_type_ids`. If it does,
+  thread it through `GeneratorOutput`; if not, build it via the HF processor's own helper so video tokens are covered.
+- **Status:** open (needs investigation).
+
+## 9. The VLM generator is a fork of `agent_loop`, not hooks into the base generator
+- **Symptom:** `SkyRLVLMGymGenerator.agent_loop` (`skyrl/train/generators/skyrl_vlm_generator.py:73-237`)
+  is a full re-implementation. It has already drifted from the base: the `max_tokens` argument is
+  accepted but never used (`:78`), and there's no custom chat template support. The generator also
+  only decodes `pixel_values` from the *last* render (`:215`), and it relies on each turn's tokens
+  being a prefix of the next render. Its own NOTE (`:134-137`) says that assumption fails for
+  thinking models such as Qwen3-Thinking, and nothing checks for it at runtime.
+- **Unsupported with VLM (hard errors):** `generator.batched=true` (`:56`, `:239`), step-wise
+  trajectories (`:58`, `generators/utils.py:1005`), `use_conversation_multi_turn=false` (`:60`),
+  `remove_microbatch_padding` / sequence packing and sequence parallelism
+  (`model_wrapper.py:333-336`; Megatron `megatron_model_wrapper.py:304-308`), sample-support
+  capture and R3 replay (`config.py:1861,1865`). Fully-async training has no explicit guard or test.
+- **Proposed fix:** (a) assert a prefix match between consecutive renders, or fall back to
+  per-turn token re-extraction; (b) honor `max_tokens`; (c) longer term, fold the
+  render-based path into the base generator behind a renderer interface so the text and VLM paths share code.
+  Packing for VLM needs per-model 3D mRoPE position ids (`get_rope_index`), which is the biggest perf item,
+  because `remove_microbatch_padding=false` currently pads every sequence to the batch max (3061 tokens
+  observed against a ~1300 mean response).
+- **Status:** open (proposal).
+
+## 10. VLM detection is duplicated three times
+- **Symptom:** `hasattr(config, "vision_config")` is repeated in `model_wrapper.py:182`,
+  `megatron_worker.py:194` and `fsdp_worker.py:64`, while `skyrl/utils/tok.py` already has `check_is_vlm`.
+- **Proposed fix:** use the shared helper everywhere.
+- **Status:** open (cleanup).

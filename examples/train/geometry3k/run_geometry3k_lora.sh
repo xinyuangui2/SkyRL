@@ -7,10 +7,6 @@ set -x
 # in docs/content/docs/examples/geometry3k.mdx for a walkthrough of the
 # VLM-specific overrides below.
 #
-# Prereq: VLM runs need a newer vLLM than the repo's pinned 0.19.0. See
-# docs/content/docs/tutorials/vision_language_rl.mdx for the one-line
-# [tool.uv.sources] override you need to add to the root pyproject.toml.
-#
 # uv run examples/train/geometry3k/geometry_3k_dataset.py --output_dir $HOME/data/geometry_3k
 # bash examples/train/geometry3k/run_geometry3k_lora.sh
 
