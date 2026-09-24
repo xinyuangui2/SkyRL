@@ -131,13 +131,14 @@ Format: one entry per gap — symptom, where, proposed fix, status.
   EXPORT_PATH=/mnt/cluster_storage/geo3k/exports bash examples/train/geometry3k/run_geometry3k.sh
   trainer.ckpt_path=/mnt/cluster_storage/geo3k/ckpts` (needs the entry #5 fix for `WANDB_ENTITY` to reach the workers).
 - **wandb:** https://wandb.ai/sky-posttraining-uc-berkeley/geometry3k/runs/hqyvet2l
-- **Eval (test split, 601 examples, pass@1):** step 0 **0.534**, step 5 0.526, step 10 0.539.
+- **Eval (test split, 601 examples, pass@1):** step 0 **0.534**, 5 0.526, 10 0.539, 15 0.571,
+  20 0.589, 25 0.632, 30 **0.654** (+12 pts by step 30; run still in progress).
 - **Step time:** about 90-97 s per normal step: generate ~31 s (33%), forward logprobs ~13 s (14%),
   policy_train ~40 s (43%), weight sync ~7 s (7%). Eval adds ~105 s and checkpointing adds
   125-165 s every 5 steps (entry #6).
 - **Peak GPU memory:** ~66.6-67.7 GiB of 80 GiB on each GPU (nvidia-smi, sampled 1 Hz over ~3 steps).
 - **Train reward (avg_final_reward, steps 1-13):** 0.463 0.512 0.424 0.531 0.451 0.539 0.537 0.453
-  0.512 0.533 0.461 0.535 0.473. Flat and noisy, with no clear trend yet at lr=1e-6. Mean response is ~1.2-1.35k
+  0.512 0.533 0.461 0.535 0.473, noisy at first. It trends up from step ~14, reaching 0.55-0.66 around step 30. Mean response is ~1.2-1.35k
   tokens, and batches pad to ~3.0k because packing is off for VLM (entry #9).
 - **Blockers hit:** multi-node data path (#2), wandb entity not forwarded (#5). Both have workarounds or fixes.
   No VLM-specific crashes.
