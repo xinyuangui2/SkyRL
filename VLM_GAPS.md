@@ -149,7 +149,17 @@ Format: one entry per gap — symptom, where, proposed fix, status.
   backend or config A/B comparisons from one eval point unreliable (see the Run 2 analysis).
 - **Proposed fix:** for comparisons, evaluate with `n>1` samples at temperature>0 and report mean pass@1,
   or enable vLLM batch-invariant / deterministic mode for eval. Document the noise floor in the recipe docs.
-- **Status:** open.
+- **Status:** **measured** 2026-09-25 (stock `run_geometry3k.sh`, Qwen3-VL-8B, step-0 weights, eval only; logs
+  `/tmp/geo3k_verify_12{a,b,c}.log`, dumps under `/mnt/cluster_storage/geo3k/verify12/`).
+  - Two greedy evals with the identical config: pass@1 **0.534 vs 0.526**. Per question, **530/601 agree (88.2%)**
+    and 71 flip (38 one way, 33 the other). This matches the 56 flips between the Run 1 and Run 2 step-0 evals. The per-eval noise floor
+    for greedy is about ±1-1.5 pts, and single-point differences up to ~3 pts aren't meaningful.
+  - `generator.eval_n_samples_per_prompt=4`, `generator.eval_sampling_params.temperature=0.6`: mean pass@1 **0.459**
+    over 2404 samples (pass@4 0.614). The per-draw accuracies are 0.468 / 0.439 / 0.463 / 0.466 (std 1.3 pts), so the 4-sample mean
+    carries about ±0.7 pts. Temperature-0.6 sampling scores ~7 pts below greedy on this model, so
+    sampled and greedy numbers aren't comparable with each other.
+  - **Recommendation:** for backend or config A/B comparisons, use `eval_n_samples_per_prompt>=4` and compare mean pass@1
+    (or run greedy eval at least twice). Don't read differences under ~3 pts from one greedy eval.
 
 ## 13. Critic path ignores `pixel_values`
 - **Symptom:** the critic forward (`worker.py:1629-1634`) passes only `sequences`/`attention_mask`; no
