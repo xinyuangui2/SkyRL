@@ -158,7 +158,18 @@ Format: one entry per gap — symptom, where, proposed fix, status.
   would score image-placeholder tokens with no image attached.
 - **Proposed fix:** reject `critic.model.path` + `vision_language_generator` in config validation
   until `pixel_values` is plumbed through `CriticWorkerBase`.
-- **Status:** found by code reading; needs a GPU repro.
+- **Status:** verified 2026-09-25. **The run fails cleanly at startup, earlier than predicted.** The missing-`pixel_values` path
+  can't be reached yet. Setup: Qwen3-VL-2B policy and critic, `advantage_estimator=gae`, `critic_mini_batch_size=64`
+  (the default critic mini-batch fails `validate_batch_sizes` against `train_batch_size=128`). Log: `/tmp/geo3k_verify_13.log`.
+  - Crash: `FSDPCriticWorkerBase.init_model` (`fsdp_worker.py:276`) calls `get_llm_for_sequence_regression`, which builds the value head with
+    `nn.Linear(config.hidden_size, 1)` (`model_wrapper.py:503`). That raises
+    `AttributeError: 'Qwen3VLConfig' object has no attribute 'hidden_size'`, because for VLMs it lives under
+    `config.text_config.hidden_size`. It happens in `build_models`, before any rollout.
+  - So today a VLM critic is a hard error, not a silent one. But a one-line `hidden_size` fix would expose the
+    silent path this entry describes (the critic forward passes no `pixel_values`).
+  - **Proposed fix (unchanged, now more urgent):** reject `critic.model.path` with a VLM config (or
+    `vision_language_generator=true`) in config validation, with a clear message, until `pixel_values`/`image_grid_thw`
+    are plumbed through `CriticWorkerBase` and the value head uses `text_config.hidden_size`.
 
 ## 14. LoRA lands on the vision tower; rollout never sees those deltas
 - **Symptom:** default `target_modules="all-linear"` with `exclude_modules=None` (`config.py:110-116`);
