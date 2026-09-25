@@ -203,7 +203,19 @@ Format: one entry per gap — symptom, where, proposed fix, status.
   travel as base64 on every render and every generate (`remote_inference_client.py:300,819`).
 - **Prior art:** verl only zeroes this for vLLM < 0.22 (pause/resume cache desync); we're on 0.30.
 - **Proposed fix:** re-enable the cache (config knob, default > 0) once pause/resume is confirmed safe.
-- **Status:** needs an A/B on generate time.
+- **Status:** verified 2026-09-25. **Safe to enable, but no measurable speedup on geometry3k.** Logs:
+  `/tmp/geo3k_verify_16{a,b}.log`. W&B: baseline https://wandb.ai/sky-posttraining-uc-berkeley/geometry3k-verify/runs/3q1mk7me,
+  cache=4 GB https://wandb.ai/sky-posttraining-uc-berkeley/geometry3k-verify/runs/0qci777k. Setup: 4 steps each, Qwen3-VL-8B FSDP, stock recipe.
+  - The override works. `build_vllm_cli_args` gives `mm_processor_cache_gb=0` by default, and
+    `engine_init_kwargs={"mm_processor_cache_gb": 4}` produces 4 (it's applied after the hard-coded overrides). vLLM
+    doesn't log its engine args to the Ray worker logs, so this was confirmed by calling the builder with the run's config.
+  - Per-step generate time: baseline 32.2 / 30.2 / 30.3 / 30.6 s, cache 32.4 / 29.7 / 30.2 / 31.2 s. Step time:
+    109.5 / 91.1 / 95.3 / 89.5 s vs 111.5 / 92.1 / 91.9 / 91.8 s. Rewards (0.488 / 0.533 / 0.451 / 0.549 vs
+    0.471 / 0.541 / 0.436 / 0.518) and response lengths (1114-1322 vs 1183-1333) are in the same range.
+  - No errors across 4 weight-sync pause/resume cycles with the cache on, so the #1494 desync didn't reproduce on vLLM 0.30.
+  - Why no gain here: geometry3k has one small diagram per prompt (63-699 image tokens, p50 95) and at most 3 renders
+    per trajectory, so HF image preprocessing is a negligible part of the ~30 s generate phase. It may matter
+    for image-heavy multi-turn envs such as VisGym (a new image every step), which is worth an A/B there before changing the default.
 
 ## 17. Microbatch cost is rows x batch-max-len under `remove_microbatch_padding=False`
 - **Symptom:** the token budget counts `attention_mask.sum()` (`worker_utils.py:286`), but
