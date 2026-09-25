@@ -176,7 +176,25 @@ Format: one entry per gap — symptom, where, proposed fix, status.
 - **Prior art:** verl/EasyR1 `filter_overlong_prompts` runs the processor in `doc2len`.
 - **Proposed fix:** measure prompt length via the processor (or vLLM render) in the filter, and log a
   `truncated_at_turn_0` count.
-- **Status:** needs a count on geometry3k at `max_prompt_length=1024`.
+- **Status:** verified 2026-09-25. **The undercount is real, but it doesn't bite geometry3k at 1024.** The actual waste comes from
+  `generator.max_input_length` on later turns. Log: `/tmp/geo3k_verify_15.log`.
+  - Tokenizer length (what the dataset filter uses), train split: p50 140, max 239. Processor length with
+    images expanded: p50 245, p90 406, p99 576, max 844 (test split: max 686). Images add 63-699 tokens that
+    the filter doesn't see. Rows with (b) > 1024 while (a) <= 1024: **0** (train and test). At a 512 limit it
+    would be 54 train and 20 test rows.
+  - Eval dumps (Run 1/2): **0** empty responses, so no trajectory is cut at turn 0.
+  - **But** `generator.max_input_length` defaults to `trainer.max_prompt_length` (`config.py:1826`), so it's
+    also 1024, and the VLM generator checks it against the *whole* conversation before every turn
+    (`skyrl_vlm_generator.py:155`). With `max_generate_length=2048` per turn, a wrong first answer
+    followed by the env's "try again" observation usually already exceeds 1024 tokens, so the loop breaks with
+    `stop_reason=length` and reward 0 before the retry turn. These trajectories end in the env's
+    retry prompt plus `<|im_start|>assistant\n` and have no final answer. Count of eval trajectories cut this way:
+    **27/601 at step 0 (FSDP), 77/601 at step 30 (FSDP), 93/601 at step 90 (Megatron)**. The count grows as
+    the policy learns to use `calc_score`. The remaining length stops are real 2048-token turns (215, 104 and 56 respectively).
+  - **Proposed recipe fix:** set `generator.max_input_length` explicitly in the geometry3k scripts
+    (e.g. 4096 = prompt <= 844 + a 2048-token turn + observations), and log a per-batch count of
+    trajectories stopped by `max_input_length`. The filter fix (measure with the processor) is still worth doing
+    for image-heavy datasets.
 
 ## 16. `mm_processor_cache_gb=0` is hard-coded, so images are re-processed every render
 - **Symptom:** `inference_servers/utils.py:200` disables vLLM's multimodal processor cache (since #1494).
