@@ -140,6 +140,17 @@ Format: one entry per gap — symptom, where, proposed fix, status.
   that Megatron SP is fine for Qwen3-VL), and add a docs row for the Megatron VLM recipe.
 - **Status:** recipe added; guard question open. See the Megatron run results below.
 
+## 12. Greedy eval isn't reproducible: ~10% of answers flip with identical weights
+- **Symptom:** eval uses `temperature=0` (greedy). The FSDP and Megatron runs start from identical
+  weights and had the same step-0 pass@1 (0.536 on 591 matched questions), yet they disagreed on 56
+  questions (28 each way). vLLM batched greedy decoding isn't bitwise-deterministic, and multi-turn
+  tool use (`calc_score`, up to 3 turns) amplifies the divergence.
+- **Impact:** a single greedy eval of 601 questions carries roughly ±1.5-2 pts of pure decode noise, which makes
+  backend or config A/B comparisons from one eval point unreliable (see the Run 2 analysis).
+- **Proposed fix:** for comparisons, evaluate with `n>1` samples at temperature>0 and report mean pass@1,
+  or enable vLLM batch-invariant / deterministic mode for eval. Document the noise floor in the recipe docs.
+- **Status:** open.
+
 ## Run 1 summary (2026-09-24)
 - **Setup:** 8xH100 80GB (driver 580.178.04, CUDA 13.0) on a Ray GPU worker; the head node is CPU-only.
   Stock `run_geometry3k.sh` (Qwen3-VL-8B-Instruct, FSDP, colocated, GRPO, bs=128 x n=4) with
@@ -169,7 +180,16 @@ Format: one entry per gap — symptom, where, proposed fix, status.
 - **Result:** the Megatron VLM path trains Qwen3-VL-8B out of the box. No code changes were needed
   beyond the recipe, and there have been no errors so far.
 - **Eval pass@1 (Megatron vs FSDP):** step 0 0.539 / 0.534, 5 0.534 / 0.526, 10 0.557 / 0.539,
-  15 0.569 / 0.571, 20 **0.596** / 0.589. The learning curves match within noise.
+  15 0.569 / 0.571, 20 0.596 / 0.589, 25 0.589 / 0.632, 30 0.619 / 0.654, 35 **0.636** / 0.652.
+- **Is the step 25-30 gap real?** Per-question McNemar tests put FSDP's step-25 and step-30 checkpoints
+  ahead (72 vs 46 and 73 vs 49 discordant questions, p about 0.02-0.03), but that compares single
+  checkpoints from one seed each, not backends. Train-side metrics match over steps 21-34: reward 0.582 vs 0.593,
+  response length 1020 vs 998, grad norm 0.233 vs 0.237, and the trainer-vs-vLLM logprob gap is lower on Megatron
+  (0.0116 vs 0.0133), so there's no sign of a numerics bug. By step 35 the gap had narrowed to 1.6 pts,
+  inside the noise floor (#12). One consistent difference: **Megatron's policy entropy falls faster**
+  (0.236 vs 0.273 averaged over steps 21-34, lower at almost every step since step 3). Candidate causes are DP=4 vs
+  DP=8 micro-batch grouping under `token_mean_legacy`, or different vision-tower handling. It's worth a
+  seed-controlled rerun before drawing conclusions.
 - **Step time:** 88-104 s per normal step (FSDP: 90-97 s). The split is generate ~32 s, forward logprobs ~13 s,
   policy_train ~37-41 s, weight sync 6-13 s. Checkpoint saves take 141-154 s (FSDP: 125-165 s), so gap #6 applies here too.
 - **Peak GPU memory:** ~70.7-72.1 GiB of 80 GiB per GPU, about 4 GiB more than FSDP.
