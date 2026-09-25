@@ -292,23 +292,35 @@ Format: one entry per gap — symptom, where, proposed fix, status.
   `docs/content/docs/examples/visgym.mdx:29-33`.
 - **Status:** open (docs).
 
-## 23. Every multi-turn response has a doubled `<|im_end|>` at the turn boundary (candidate)
+## 23. VLM generator feeds `<|im_end|>` back into the conversation, so every turn boundary gets a doubled `<|im_end|>`
 - **Symptom:** in the eval dumps, every trajectory with more than one assistant turn contains
-  `...</tool_call><|im_end|><|im_end|>\n<|im_start|>user\n...` in `output_response`, which is decoded from `response_ids`
-  (75/75 multi-turn at FSDP step 0, 192/192 at Megatron step 90). No single-turn trajectory has it. The extra
-  token sits at the start of the observation slice (`loss_mask=0`), so it isn't trained on, but the trainer's
-  context for turn 2+ tokens contains a token sequence the chat template never produces.
-- **Ruled out (2026-09-25):** the HF chat template and vLLM's render server (`vllm launch render` via
-  `CPURenderServer`) both render `[user, assistant(tool_call), user(obs)]` with a single `<|im_end|>` and identical
-  token ids (`/tmp/geo3k_probe_render_cpu.log`). Stock vLLM `/v1/completions` returns exactly one trailing
-  `<|im_end|>` in the response token ids. An offline prefix check (HF template) gives offset == len(gen_ids).
-- **Open:** so the extra token most likely comes from the SkyRL generate path (e.g. the response ids it returns), or
-  from a real render/gen token-count mismatch in `pending_obs_offset = len(input_ids) + len(gen_ids)`
-  (`skyrl_vlm_generator.py:~207`) that doesn't show on synthetic text. It also matters for vLLM: if the turn-2 render and the
-  trainer sequence disagree, turn-2 logprobs are computed on a different context than the rollout's.
-- **Next step:** log `input_ids[pending_obs_offset-2:pending_obs_offset+3]` and `gen_ids[-3:]` for one trajectory in a
-  2-step run; add an assertion that `input_ids[:pending_obs_offset] == prev_input_ids + gen_ids`.
-- **Status:** open (found during verification, root cause not isolated).
+  `...</tool_call><|im_end|><|im_end|>\n<|im_start|>user\n...` (75/75 multi-turn at FSDP step 0, 192/192 at
+  Megatron step 90). No single-turn trajectory has it.
+- **Root cause (runtime probe, 2026-09-25):** `gen_text` **ends with a literal `<|im_end|>`**. `RemoteInferenceClient.generate`
+  doesn't use vLLM's output text. It re-detokenizes `response_ids` via `self.detokenize()` →
+  `self.tokenizer.batch_decode(token_ids)` **without `skip_special_tokens=True`**
+  (`remote_inference_client.py:618-624, 1016-1017`). So the `skip_special_tokens=True` in the sampling params (`engine_utils.py:59`)
+  never applies to `responses`, which contradicts the contract documented in `base.py:43-47`. The text generator
+  works around this by stripping a trailing eos before appending the assistant message (`skyrl_gym_generator.py:838-840`).
+  The VLM generator appends `gen_text` as-is (`skyrl_vlm_generator.py:~190`), and the chat template adds its own `<|im_end|>`.
+- **Probe data** (temporary instrumentation, Qwen3-VL-2B, 1 step, 3 multi-turn boundaries; log `/tmp/geo3k_verify_23.log`):
+  - `gen_ids[-4:]` = `['}}', '</tool_call>', '<|im_end|>']` (one eos); `gen_text[-40:]` ends in `</tool_call><|im_end|>`; no `<think>`.
+  - Prefix check: `rendered[:prev_len] == prev_input_ids` in 3/3. The rendered assistant region up to its first `<|im_end|>` is exactly
+    `len(gen_ids)-1` tokens, so `pending_obs_offset = len(input_ids)+len(gen_ids)` is arithmetically correct, and the obs slice
+    starts at the template's second `<|im_end|>`: `['</tool_call>', '<|im_end|>', '<|im_end|>', 'Ċ', '<|im_start|>', 'user']`.
+  - **vLLM's turn-2 prompt contains the double too** (3/3), so rollout and trainer see the same doubled token. The harm
+    is an off-template context for every turn >= 2 (and an extra masked token), not a logprob mismatch.
+  - **Separate, smaller mismatch (1/3):** the render re-tokenizes the assistant text non-identically to what the model generated,
+    with the same length but different ids (generated `')'`, `'"}}'` vs rendered `')"'`, `'}}'`). There the trainer sequence has
+    the generated ids while vLLM's turn-2 prompt had the re-tokenized ones, so turn-2+ tokens are scored on a slightly
+    different context than they were sampled from. This is the BPE non-canonical-tokenization case of the NOTE at `skyrl_vlm_generator.py:134-137`.
+- **Proposed fix:** (1) minimal: strip a trailing `tokenizer.eos_token` from `gen_text` before appending the assistant message in the
+  VLM generator, mirroring `skyrl_gym_generator.py:838-840`. (2) Better: make `RemoteInferenceClient.generate` honor its contract
+  (`batch_decode(..., skip_special_tokens=True)` for `responses`; the HTTP `/detokenize` fallback needs the same). This needs a check that
+  no model relies on special tokens surviving in `responses`, e.g. models whose `<think>` is a special token.
+  (3) For the re-tokenization case, the robust fix from #9(a): assert `input_ids[:pending_obs_offset] == prev_input_ids + gen_ids`,
+  and on mismatch compute obs tokens by diffing the renders of `[..., assistant]` and `[..., assistant, obs]` instead of trusting the offset.
+- **Status:** root cause identified; fix not applied.
 
 ## Recheck notes (2026-09-25)
 Corrections to the earlier framework comparison: verl's `freeze_vision_tower` is config-only (nothing
@@ -381,7 +393,7 @@ Short GPU runs on 8xH100 to confirm gaps from the code-reading recheck. W&B proj
 | #14 LoRA on the vision tower | **Confirmed** | 208/600 exported LoRA tensors are `visual.*` and are trained (lora_B nonzero); vLLM logs only an INFO about `enable_tower_connector_lora` and silently skips them; `exclude_modules='.*visual.*'` gives an LM-only adapter and trains fine |
 | #13 critic without `pixel_values` | **Hard crash at init, before the predicted silent bug** | `model_wrapper.py:503` `config.hidden_size` raises AttributeError on `Qwen3VLConfig`; a config-validation guard is still needed |
 | #12 greedy eval noise | **Measured** | Identical config twice: 88.2% per-question agreement, 0.534 vs 0.526; n=4 at T=0.6: mean 0.459, per-draw std 1.3 pts |
-| #23 doubled `<|im_end|>` (new) | **Open** | In 100% of multi-turn responses; the render server and vLLM generation are ruled out; next step is instrumenting the generator |
+| #23 doubled `<|im_end|>` (new) | **Root cause found** | `RemoteInferenceClient.detokenize` keeps special tokens, so `gen_text` ends in `<|im_end|>` and the template adds a second one; also in vLLM's turn-2 prompt (consistent, off-template). Plus a rarer BPE re-tokenization mismatch (1/3 boundaries) |
 
 Suggested priority: #15 (set `generator.max_input_length` in the recipe, a one-line recipe fix with a direct accuracy impact),
-#14 (default-exclude the vision tower for LoRA), #13 (validation guard), then #23 (root cause).
+#14 (default-exclude the vision tower for LoRA), #13 (validation guard), #23 (strip the eos in the VLM generator, a 2-line fix).
