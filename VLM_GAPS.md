@@ -292,6 +292,24 @@ Format: one entry per gap — symptom, where, proposed fix, status.
   `docs/content/docs/examples/visgym.mdx:29-33`.
 - **Status:** open (docs).
 
+## 23. Every multi-turn response has a doubled `<|im_end|>` at the turn boundary (candidate)
+- **Symptom:** in the eval dumps, every trajectory with more than one assistant turn contains
+  `...</tool_call><|im_end|><|im_end|>\n<|im_start|>user\n...` in `output_response`, which is decoded from `response_ids`
+  (75/75 multi-turn at FSDP step 0, 192/192 at Megatron step 90). No single-turn trajectory has it. The extra
+  token sits at the start of the observation slice (`loss_mask=0`), so it isn't trained on, but the trainer's
+  context for turn 2+ tokens contains a token sequence the chat template never produces.
+- **Ruled out (2026-09-25):** the HF chat template and vLLM's render server (`vllm launch render` via
+  `CPURenderServer`) both render `[user, assistant(tool_call), user(obs)]` with a single `<|im_end|>` and identical
+  token ids (`/tmp/geo3k_probe_render_cpu.log`). Stock vLLM `/v1/completions` returns exactly one trailing
+  `<|im_end|>` in the response token ids. An offline prefix check (HF template) gives offset == len(gen_ids).
+- **Open:** so the extra token most likely comes from the SkyRL generate path (e.g. the response ids it returns), or
+  from a real render/gen token-count mismatch in `pending_obs_offset = len(input_ids) + len(gen_ids)`
+  (`skyrl_vlm_generator.py:~207`) that doesn't show on synthetic text. It also matters for vLLM: if the turn-2 render and the
+  trainer sequence disagree, turn-2 logprobs are computed on a different context than the rollout's.
+- **Next step:** log `input_ids[pending_obs_offset-2:pending_obs_offset+3]` and `gen_ids[-3:]` for one trajectory in a
+  2-step run; add an assertion that `input_ids[:pending_obs_offset] == prev_input_ids + gen_ids`.
+- **Status:** open (found during verification, root cause not isolated).
+
 ## Recheck notes (2026-09-25)
 Corrections to the earlier framework comparison: verl's `freeze_vision_tower` is config-only (nothing
 reads it); SkyRL can already reach `limit_mm_per_prompt` / `mm_processor_cache_gb` via
@@ -351,3 +369,19 @@ model receives `pixel_values`, the processor is saved on HF export for both back
   policy_train ~37-41 s, weight sync 6-13 s. Checkpoint saves take 141-154 s (FSDP: 125-165 s), so gap #6 applies here too.
 - **Peak GPU memory:** ~70.7-72.1 GiB of 80 GiB per GPU, about 4 GiB more than FSDP.
 - **Step-1 metrics vs FSDP:** entropy 0.355 vs 0.343, grad_norm 0.226 vs 0.179, clip_ratio 4.3e-4 vs 3.8e-4.
+
+## Verification run (2026-09-25)
+Short GPU runs on 8xH100 to confirm gaps from the code-reading recheck. W&B project `geometry3k-verify`
+(entity `sky-posttraining-uc-berkeley`); logs are `/tmp/geo3k_verify_<n>.log` on the devbox.
+
+| Gap | Verdict | Evidence |
+|---|---|---|
+| #15 prompt-length filter | **Real but harmless at 1024 for geometry3k.** The real loss is `max_input_length` on later turns | Images add 63-699 tokens the filter doesn't see (expanded max 844), so 0 rows > 1024. But `generator.max_input_length` (= 1024 by default) cuts the retry turn in 27/601 (step 0) to 93/601 (step 90) eval trajectories, all reward 0 |
+| #16 `mm_processor_cache_gb=0` | **Safe to enable on vLLM 0.30; no speedup on geometry3k** | Override via `engine_init_kwargs` works; generate 30-32 s/step either way; no errors across 4 pause/resume cycles |
+| #14 LoRA on the vision tower | **Confirmed** | 208/600 exported LoRA tensors are `visual.*` and are trained (lora_B nonzero); vLLM logs only an INFO about `enable_tower_connector_lora` and silently skips them; `exclude_modules='.*visual.*'` gives an LM-only adapter and trains fine |
+| #13 critic without `pixel_values` | **Hard crash at init, before the predicted silent bug** | `model_wrapper.py:503` `config.hidden_size` raises AttributeError on `Qwen3VLConfig`; a config-validation guard is still needed |
+| #12 greedy eval noise | **Measured** | Identical config twice: 88.2% per-question agreement, 0.534 vs 0.526; n=4 at T=0.6: mean 0.459, per-draw std 1.3 pts |
+| #23 doubled `<|im_end|>` (new) | **Open** | In 100% of multi-turn responses; the render server and vLLM generation are ruled out; next step is instrumenting the generator |
+
+Suggested priority: #15 (set `generator.max_input_length` in the recipe, a one-line recipe fix with a direct accuracy impact),
+#14 (default-exclude the vision tower for LoRA), #13 (validation guard), then #23 (root cause).
