@@ -166,7 +166,23 @@ Format: one entry per gap — symptom, where, proposed fix, status.
   (`fsdp_worker.py:159-180`). vLLM applies LoRA only to the language model of multimodal models, so the
   trainer's policy diverges from the rollout policy.
 - **Proposed fix:** default `exclude_modules` to vision modules when `is_vlm`; document the choice.
-- **Status:** vLLM-side drop unverified; needs a GPU repro (inspect exported adapter + vLLM logs).
+- **Status:** **confirmed** 2026-09-25 (Qwen3-VL-2B, `run_geometry3k_lora.sh`, 2 steps; logs
+  `/tmp/geo3k_verify_14{a,c}.log`; W&B https://wandb.ai/sky-posttraining-uc-berkeley/geometry3k-verify/runs/x3lg11bn and
+  https://wandb.ai/sky-posttraining-uc-berkeley/geometry3k-verify/runs/cap8edt0).
+  - (a) The exported adapter (`lora_sync_path/adapter_model.safetensors`) has **600 tensors: 392 on
+    `language_model`, 208 on `visual`** (16 on `visual.merger`, 12 on `deepstack_merger_list`). PEFT expands
+    `all-linear` to include the vision names `qkv`, `attn.proj`, `linear_fc1`, `linear_fc2`. After 2 steps all
+    104 visual `lora_B` matrices are nonzero (mean norm 0.0168 vs 0.0194 on the LM), so training does update the vision tower.
+  - (b) vLLM 0.30 drops them silently. All 8 engines log only an INFO line at startup:
+    `Qwen3VLForConditionalGeneration supports adding LoRA to the tower modules. If needed, please set
+    enable_tower_connector_lora=True`. With that off, `LoRAModelManager` never wraps tower modules
+    (`vllm/lora/model_manager.py:209-216`). The adapter still loads without an unexpected-module error, so the visual
+    deltas are discarded with no warning. The trainer's policy (LoRA'd vision tower) and the rollout policy (base
+    vision tower) diverge.
+  - (c) With `trainer.policy.model.lora.exclude_modules='.*visual.*'` (a PEFT regex), the export has 392 tensors, all
+    `language_model`, and both steps train normally.
+  - **Fix options:** default `exclude_modules` to `.*visual.*` when the model is a VLM (the minimal change), or pass
+    `enable_tower_connector_lora=True` to vLLM (marked experimental in vLLM) to keep training the tower.
 
 ## 15. Prompt-length filter undercounts image tokens; oversized prompts silently waste samples
 - **Symptom:** the dataset filter uses `tokenizer.apply_chat_template`, which emits one placeholder per
