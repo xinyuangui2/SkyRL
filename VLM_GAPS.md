@@ -151,6 +151,88 @@ Format: one entry per gap — symptom, where, proposed fix, status.
   or enable vLLM batch-invariant / deterministic mode for eval. Document the noise floor in the recipe docs.
 - **Status:** open.
 
+## 13. Critic path ignores `pixel_values`
+- **Symptom:** the critic forward (`worker.py:1629-1634`) passes only `sequences`/`attention_mask`; no
+  vision inputs. `CriticModel` is built from `AutoModel._model_mapping[type(config)]`
+  (`model_wrapper.py:632`), i.e. the multimodal base for a VLM config, so PPO/GAE with a critic on a VLM
+  would score image-placeholder tokens with no image attached.
+- **Proposed fix:** reject `critic.model.path` + `vision_language_generator` in config validation
+  until `pixel_values` is plumbed through `CriticWorkerBase`.
+- **Status:** found by code reading; needs a GPU repro.
+
+## 14. LoRA lands on the vision tower; rollout never sees those deltas
+- **Symptom:** default `target_modules="all-linear"` with `exclude_modules=None` (`config.py:110-116`);
+  `run_geometry3k_lora.sh` sets no exclusion, so adapters are trained on `visual.*`/merger and exported
+  (`fsdp_worker.py:159-180`). vLLM applies LoRA only to the language model of multimodal models, so the
+  trainer's policy diverges from the rollout policy.
+- **Proposed fix:** default `exclude_modules` to vision modules when `is_vlm`; document the choice.
+- **Status:** vLLM-side drop unverified; needs a GPU repro (inspect exported adapter + vLLM logs).
+
+## 15. Prompt-length filter undercounts image tokens; oversized prompts silently waste samples
+- **Symptom:** the dataset filter uses `tokenizer.apply_chat_template`, which emits one placeholder per
+  image instead of the processor-expanded count (hundreds for geometry3k). Oversized prompts pass the
+  filter, then hit `skyrl_vlm_generator.py:155` (`len(input_ids) > max_input_length`) before any
+  generation and return an empty response with reward 0. No error, no metric.
+- **Prior art:** verl/EasyR1 `filter_overlong_prompts` runs the processor in `doc2len`.
+- **Proposed fix:** measure prompt length via the processor (or vLLM render) in the filter, and log a
+  `truncated_at_turn_0` count.
+- **Status:** needs a count on geometry3k at `max_prompt_length=1024`.
+
+## 16. `mm_processor_cache_gb=0` is hard-coded, so images are re-processed every render
+- **Symptom:** `inference_servers/utils.py:200` disables vLLM's multimodal processor cache (since #1494).
+  The VLM generator re-renders the full conversation each turn (`skyrl_vlm_generator.py:142`), so every
+  image goes through the HF image processor O(turns x images x n_samples) times, and `pixel_values`
+  travel as base64 on every render and every generate (`remote_inference_client.py:300,819`).
+- **Prior art:** verl only zeroes this for vLLM < 0.22 (pause/resume cache desync); we're on 0.30.
+- **Proposed fix:** re-enable the cache (config knob, default > 0) once pause/resume is confirmed safe.
+- **Status:** needs an A/B on generate time.
+
+## 17. Microbatch cost is rows x batch-max-len under `remove_microbatch_padding=False`
+- **Symptom:** the token budget counts `attention_mask.sum()` (`worker_utils.py:286`), but
+  `_create_microbatch_from_indices` (`:299-309`) keeps the padded `seq_len`, so the real cost of a VLM
+  microbatch is rows x max-len. Vision-encoder cost (4 patches per placeholder on Qwen3-VL) is not
+  counted at all. Follow-on of #9.
+- **Status:** open.
+
+## 18. Placeholder-token validity masking is missing
+- **Symptom:** rows that contain `image_token_id` but no attached media are not masked, so a
+  mixed/degenerate batch would make the model demand missing features (relates to #4).
+- **Prior art:** NeMo-RL `build_media_token_validity_mask`; EasyR1 maps `image_token_id -> -100`.
+- **Status:** open.
+
+## 19. Qwen3-VL deepstack under packing / CP
+- **Symptom:** any packing or CP implementation for #9 must also slice `deepstack_visual_embeds` /
+  `visual_pos_masks`; verl, AReaL, ROLL and EasyR1 all carry this patch. Not a bug today (packing is
+  blocked), but a prerequisite for #9.
+- **Status:** open (design note).
+
+## 20. No VLM trainer-vs-inference logprob parity test
+- **Symptom:** #2276 added the text parity check; nothing exercises it with `pixel_values`. ROLL has a
+  full VLM suite (vLLM -> FSDP2 vs HF, incl. CP2).
+- **Proposed fix:** extend the #2276 example to Qwen3-VL and add a CPU mRoPE position-id test.
+- **Status:** open.
+
+## 21. Eval dumps are image-blind; parquet has no image dedup or size cap
+- **Symptom:** `trainer_utils.py:337` decodes `prompt_token_ids`, so dumps are runs of `<|image_pad|>`
+  with no image reference. `geometry_3k_dataset.py:42-49` stores one base64 JPEG per row at default
+  quality with no resize cap, and the same bytes are re-sent per sample per turn (#16).
+- **Proposed fix:** dump the original prompt with data URIs replaced by an image hash; cap image size
+  in prep.
+- **Status:** open.
+
+## 22. Docs say Megatron VLM is "not wired"; visgym doc still cites the removed vLLM override
+- **Where:** `vision_language_rl.mdx` (Limitations + broken `skyrl-train/` SFT link),
+  `docs/content/docs/examples/visgym.mdx:29-33`.
+- **Status:** open (docs).
+
+## Recheck notes (2026-09-25)
+Corrections to the earlier framework comparison: verl's `freeze_vision_tower` is config-only (nothing
+reads it); SkyRL can already reach `limit_mm_per_prompt` / `mm_processor_cache_gb` via
+`engine_init_kwargs` (not first-class knobs); `min/max_pixels` and a vision-tower freeze remain
+missing. A future freeze flag needs a name filter in `FsdpWeightSource` (`sources.py:66-77`) or the
+frozen tower is re-synced every step. Verified OK: image observation tokens are loss-masked, the ref
+model receives `pixel_values`, the processor is saved on HF export for both backends.
+
 ## Run 1 summary (2026-09-24)
 - **Setup:** 8xH100 80GB (driver 580.178.04, CUDA 13.0) on a Ray GPU worker; the head node is CPU-only.
   Stock `run_geometry3k.sh` (Qwen3-VL-8B-Instruct, FSDP, colocated, GRPO, bs=128 x n=4) with
