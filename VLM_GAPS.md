@@ -172,15 +172,23 @@ Format: one entry per gap — symptom, where, proposed fix, status.
 - **Blockers hit:** multi-node data path (#2), wandb entity not forwarded (#5). Both have workarounds or fixes.
   No VLM-specific crashes.
 
-## Run 2 summary: Megatron backend (2026-09-24, in progress)
+## Run 2 summary: Megatron backend (2026-09-24, completed)
 - **Launch:** `WANDB_ENTITY=sky-posttraining-uc-berkeley LOGGER=wandb DATA_DIR=/mnt/cluster_storage/geo3k/data
   EXPORT_PATH=/mnt/cluster_storage/geo3k/exports_megatron CKPT_PATH=/mnt/cluster_storage/geo3k/ckpts_megatron
   bash examples/train/geometry3k/run_geometry3k_megatron.sh` (TP=2, PP=1, DP=4; otherwise identical to Run 1).
 - **wandb:** https://wandb.ai/sky-posttraining-uc-berkeley/geometry3k/runs/v5xewvd2
 - **Result:** the Megatron VLM path trains Qwen3-VL-8B out of the box. No code changes were needed
-  beyond the recipe, and there have been no errors so far.
+  beyond the recipe. The full recipe (6 epochs, 96 steps) completed with exit code 0 in 3 h 52 min
+  (16:17 to 20:10), with no errors.
+- **Final eval pass@1:** 0.539 at step 0, peak **0.729** at step 90, 0.720 at step 95, 0.697 at the final step 96
+  (+16 to +19 pts). Full series: 0 0.539, 5 0.534, 10 0.557, 15 0.569, 20 0.596, 25 0.589, 30 0.619, 35 0.636,
+  40 0.627, 45 0.657, 50 0.622, 55 0.659, 60 0.661, 65 0.677, 70 0.672, 75 0.664, 80 0.676, 85 0.694, 90 0.729,
+  95 0.720, 96 0.697.
+- **Train reward (16-step epoch means):** 0.507, 0.568, 0.610, 0.625, 0.662, 0.685. It rises steadily through all
+  6 epochs. Mean response length fell from ~1300 to ~770 tokens.
 - **Eval pass@1 (Megatron vs FSDP):** step 0 0.539 / 0.534, 5 0.534 / 0.526, 10 0.557 / 0.539,
-  15 0.569 / 0.571, 20 0.596 / 0.589, 25 0.589 / 0.632, 30 0.619 / 0.654, 35 **0.636** / 0.652.
+  15 0.569 / 0.571, 20 0.596 / 0.589, 25 0.589 / 0.632, 30 0.619 / 0.654, 35 0.636 / 0.652
+  (FSDP was stopped at step 38; Megatron then surpassed FSDP's best at step 45).
 - **Is the step 25-30 gap real?** Per-question McNemar tests put FSDP's step-25 and step-30 checkpoints
   ahead (72 vs 46 and 73 vs 49 discordant questions, p about 0.02-0.03), but that compares single
   checkpoints from one seed each, not backends. Train-side metrics match over steps 21-34: reward 0.582 vs 0.593,
