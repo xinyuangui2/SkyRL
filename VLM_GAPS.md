@@ -406,6 +406,22 @@ Format: one entry per gap — symptom, where, proposed fix, status.
 - **Proposed fix:** limitations section listing #25-#30; an `examples/tinker/` RL-with-images recipe.
 - **Status:** open (docs).
 
+## 32. Megatron-Bridge freezes the LM and vision tower of Qwen3-VL MoE by default; SkyRL never overrides it
+- **Symptom:** `Qwen3VLMoEModelProvider` defaults `freeze_language_model=True, freeze_vision_model=True`
+  (bridge `models/qwen_vl/qwen3_vl_provider.py:272-273`, applied in `provide()` at `:334-338`); the dense
+  `Qwen3VLModelProvider` defaults both to `False` (`:109-111`). SkyRL sets no `freeze_*` on the provider
+  (`megatron_worker.py:290-310`; repo-wide grep for `freeze_language_model` is empty). Any Megatron run
+  of a Qwen3-VL MoE (RL via #24's recipe, or SFT) silently trains only the vision projector, with no
+  warning, while loss/reward/ckpt logging look normal.
+- **Fix (in this branch):** `run_geometry3k_30b_a3b_megatron.sh` now passes
+  `transformer_config_kwargs.freeze_language_model=false` and `freeze_vision_model=false` (the
+  `setattr` loop at `megatron_worker.py:308-310` forwards them to the provider).
+- **Proposed:** in `megatron_worker.init_configs`, set the three `freeze_*` fields explicitly from a new
+  `trainer.policy.model.freeze_vision_tower` (+ language) config (this is also the P2 "freeze vision
+  tower" feature), and log the trainable-parameter count by submodule at startup so a frozen tower is
+  visible. Same applies to the SFT path (`sft_config` has no freeze knob either).
+- **Status:** confirmed from source; recipe patched before its first run.
+
 ## Recheck notes (2026-09-25)
 Corrections to the earlier framework comparison: verl's `freeze_vision_tower` is config-only (nothing
 reads it); SkyRL can already reach `limit_mm_per_prompt` / `mm_processor_cache_gb` via
