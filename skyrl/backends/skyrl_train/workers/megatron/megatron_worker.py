@@ -836,6 +836,18 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         if self._rank == 0:
             print_model_size(self.actor_module[0])
+            # Rank-local (TP/EP-sharded) trainable vs total params per top-level submodule, so a
+            # provider that freezes the LM or vision tower by default is visible (VLM_GAPS.md #32).
+            counts = defaultdict(lambda: [0, 0])
+            for module in self.actor_module:
+                for name, p in module.named_parameters():
+                    prefix = name.removeprefix("module.").removeprefix("module.").split(".")[0]
+                    counts[prefix][0] += p.numel() if p.requires_grad else 0
+                    counts[prefix][1] += p.numel()
+            logger.info(
+                "Trainable params (rank 0 shard): "
+                + ", ".join(f"{k}={t / 1e6:.1f}M/{n / 1e6:.1f}M" for k, (t, n) in sorted(counts.items()))
+            )
 
         # Created only on profiled ranks.
         self.profiler = build_profiler_from_policy_cfg(self.cfg)

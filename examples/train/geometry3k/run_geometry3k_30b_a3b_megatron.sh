@@ -7,8 +7,8 @@ set -x
 # and multi-node colocated vLLM.
 #
 # Parallelism (override via env):
-#   Training : TP=2, PP=1, CP=1, EP=8, ETP=1  (TP=2 keeps Megatron SP at the config verified for VLMs;
-#              fall back to MEGATRON_TP=4 MEGATRON_PP=2 if the optimizer state does not fit)
+#   Training : TP=4, PP=2, CP=1, EP=8, ETP=1 (DP=2). TP=2/PP=1 OOMs in the first policy_train step
+#              on 80GB H100s (VLM_GAPS.md #49).
 #   Inference: 4 vLLM engines x TP=4 (fall back to NUM_INFERENCE_ENGINES=2 INFERENCE_ENGINE_TP=8)
 # VLMs on Megatron: no microbatch padding removal (packing) and no context parallelism.
 #
@@ -32,8 +32,8 @@ if [ ! -f "$DATA_DIR/train.parquet" ]; then
 fi
 : "${LOGGER:=console}"
 : "${MODEL_NAME:="Qwen/Qwen3-VL-30B-A3B-Instruct"}"
-: "${MEGATRON_TP:=2}"
-: "${MEGATRON_PP:=1}"
+: "${MEGATRON_TP:=4}"
+: "${MEGATRON_PP:=2}"
 : "${MEGATRON_CP:=1}"
 : "${MEGATRON_EP:=8}"
 : "${MEGATRON_ETP:=1}"
@@ -54,6 +54,8 @@ fi
 : "${LR:=1.0e-6}"
 : "${CKPT_PATH:="$HOME/ckpts/geometry3k_vlm_30b_a3b_megatron_ckpt"}"
 : "${EXPORT_PATH:="$HOME/exports/geometry3k_vlm_30b_a3b_megatron"}"
+# Worker infra logs (per-node); put on shared storage to read them from the head node.
+: "${LOG_PATH:="/tmp/skyrl-logs"}"
 
 uv run --isolated --extra megatron --with pylatexenc \
   python examples/train/geometry3k/geometry3k_entrypoint.py \
@@ -114,7 +116,7 @@ uv run --isolated --extra megatron --with pylatexenc \
   trainer.project_name="geometry3k" \
   trainer.run_name="geometry3k_vlm_30b_a3b_megatron_tp${MEGATRON_TP}_pp${MEGATRON_PP}_ep${MEGATRON_EP}" \
   trainer.resume_mode=null \
-  trainer.log_path="/tmp/skyrl-logs" \
+  trainer.log_path="$LOG_PATH" \
   trainer.export_path="$EXPORT_PATH" \
   trainer.dump_eval_results=true \
   trainer.ckpt_path="$CKPT_PATH" \
