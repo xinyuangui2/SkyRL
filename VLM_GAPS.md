@@ -338,6 +338,74 @@ Format: one entry per gap — symptom, where, proposed fix, status.
   `megatron_config` for the vision tower under EP.
 - **Status:** recipe written, not yet run (needs a 16-GPU cluster).
 
+## 25. Tinker: non-colocated and external-inference sampling silently drop images
+- **Symptom:** colocated `sample` forwards raw chunks to the engine client, which renders images
+  (`skyrl_train_backend.py:1309-1322`, `remote_inference_client.py:673-757`). With
+  `colocate_all=false` or `external_inference_url`, requests go through
+  `SkyRLTrainInferenceForwardingClient` / `ExternalInferenceClient` (`api.py:347-362`), and both call
+  the text-only `render_model_input` (`skyrl_train_inference_forwarding.py:160`,
+  `external_inference.py:111`; `renderer.py:31-38` keeps only chunks with `.tokens`). Image chunks
+  vanish with no error; the model answers a prompt with no image.
+- **Proposed fix:** route those clients through `VLLMRenderer`, or reject image chunks with a 400
+  until they do.
+- **Status:** open (code reading; forwarding-mode image test missing).
+
+## 26. Tinker: JAX / skyrl-tx backend ignores images entirely
+- **Symptom:** `forward_backward` and `sample` both call `render_model_input` (`skyrl/backends/jax.py:644,
+  851`), so images are dropped and targets misalign. `skyrl/tx/models/` has text models only.
+  Nothing rejects the request, so the failure is silent.
+- **Proposed fix:** reject `ImageChunk` / `ImageAssetPointerChunk` on the JAX backend with a clear
+  error now; VLM support in tx is a separate project.
+- **Status:** open.
+
+## 27. Tinker: `expected_tokens` is enforced on training but not on sampling; no server-side image token count
+- **Symptom:** the training render path enforces `expected_tokens` (`renderer.py:81-182`), but
+  `_render_for_sample` does not (`remote_inference_client.py:673-757`). The prompt-length /
+  `max_tokens` check ignores image tokens (`api.py:767-778`). The SDK's `ImageChunk.length` raises
+  when `expected_tokens` is unset, and the reference server returns 400 "Expected N tokens, got M
+  from image" on mismatch (tinker-cookbook `image_token_count_test.py`), so clients must compute
+  counts from the processor config, which `get_info` / `get_sampler` do not expose (`api.py:1285-1305,
+  1380-1390`).
+- **Proposed fix:** validate `expected_tokens` on the sample path with the same 400; account for image
+  tokens in the length check; expose processor min/max pixels (or a token-count endpoint) in `get_info`.
+- **Status:** open.
+
+## 28. Tinker: training and sampling can render images differently
+- **Symptom:** `CPURenderServer` loads only tokenizer + processor (`inference_servers/render_server.py:86-106`)
+  and does not receive the engine's `mm_processor_kwargs` (e.g. max_pixels). Training renders
+  (CPU server before engines start, engine client after: `skyrl_train_backend.py:445-501, 695-705`)
+  and sampling renders can disagree on image token counts. Same class of issue as #16/#21.
+- **Proposed fix:** pass the engine's processor kwargs to the render server; add a parity test.
+- **Status:** open.
+
+## 29. Tinker: VLM needs `remove_microbatch_padding=false`, but the server default is `True`
+- **Symptom:** `config.py:1525` defaults to `True`; the VLM asserts (`model_wrapper.py:334`,
+  `megatron_model_wrapper.py:304`) fire on the first `forward_backward` with images. The cookbook doc
+  tells users to override it by hand (`cookbook.mdx`).
+- **Proposed fix:** flip it automatically when the loaded model `is_vlm`, with a log line.
+- **Status:** open (small).
+
+## 30. Tinker: sampler export and adapter sync are untested for VLMs; Megatron export lacks the processor
+- **Symptom:** FSDP HF export saves the processor (`fsdp_strategy.py:595-596`); no processor save was
+  found in the Megatron sampler export path, and adapter-only tarballs (`merge_lora=false`,
+  `skyrl_train_backend.py:390-401, 1555-1565`) carry only adapter files. LoRA target selection
+  (`megatron_worker.py:413-431`) has no vision-tower handling (same root as #14). Training-proto
+  chunks accept only `encoded_text` and `image` (`proto_serialization.py:72-89`), so
+  `ImageAssetPointerChunk` is sample-only and there is no asset storage backend. Batch padding copies
+  row 0's pixels into padded rows (`training_batch.py:631-634`).
+- **Proposed fix:** save the processor on every export path; exclude vision modules from Tinker LoRA;
+  document asset pointers as sample-only; add GPU tests for VLM forward_backward, mixed batches
+  through `_to_training_batch`, and LoRA + adapter sync with images.
+- **Status:** open.
+
+## 31. Tinker docs claim VLM is "Supported" without caveats; no RL-with-images example
+- **Where:** `docs/content/docs/tinker/overview.mdx:42`, `limitations.mdx` (no VLM section),
+  `cookbook.mdx:112-139` (only the SFT `vlm_classifier` recipe; its "needs newer vLLM" callout is
+  stale per #1). `examples/tinker/` has no VLM example. A cookbook RL loop with images should work in
+  colocated fsdp/megatron but is neither tested nor documented.
+- **Proposed fix:** limitations section listing #25-#30; an `examples/tinker/` RL-with-images recipe.
+- **Status:** open (docs).
+
 ## Recheck notes (2026-09-25)
 Corrections to the earlier framework comparison: verl's `freeze_vision_tower` is config-only (nothing
 reads it); SkyRL can already reach `limit_mm_per_prompt` / `mm_processor_cache_gb` via
