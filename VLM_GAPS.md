@@ -322,6 +322,22 @@ Format: one entry per gap — symptom, where, proposed fix, status.
   and on mismatch compute obs tokens by diffing the renders of `[..., assistant]` and `[..., assistant, obs]` instead of trusting the offset.
 - **Status:** root cause identified; fix not applied.
 
+## 24. No large-model VLM recipe; Qwen3-VL MoE on Megatron (EP) is untested
+- **Symptom:** every VLM recipe and test uses Qwen3-VL-2B/8B on one node. Nothing exercises
+  expert parallelism with a VLM, multi-node colocated vLLM with images, or the memory profile of a
+  30B-class VLM with full optimizer state. Megatron-Bridge does ship a registered `Qwen3VLMoEBridge`
+  (`models/qwen_vl/qwen3_vl_bridge.py`, source `Qwen3VLMoeForConditionalGeneration`, with
+  `vision_expert_{model,tensor}_parallel_size` provider knobs), and SkyRL dispatches via
+  `AutoBridge`, so the path exists but has never been run here. geometry3k also saturates for 8B
+  (0.73 pass@1), so a larger model needs a harder dataset to show signal.
+- **Fix (in this branch):** `examples/train/geometry3k/run_geometry3k_30b_a3b_megatron.sh`:
+  Qwen3-VL-30B-A3B-Instruct, 2x8 H100, TP=2/PP=1/EP=8/ETP=1, 4 vLLM engines x TP=4, n=8, full
+  recompute, `generator.max_input_length=8192` (#15). Fallbacks documented in the script header.
+- **Open:** run it; then swap in a harder multimodal-reasoning set (e.g. ViRL39K or MMK12) once the
+  pipeline is proven. Check whether `vision_expert_*_parallel_size` needs exposing in
+  `megatron_config` for the vision tower under EP.
+- **Status:** recipe written, not yet run (needs a 16-GPU cluster).
+
 ## Recheck notes (2026-09-25)
 Corrections to the earlier framework comparison: verl's `freeze_vision_tower` is config-only (nothing
 reads it); SkyRL can already reach `limit_mm_per_prompt` / `mm_processor_cache_gb` via
