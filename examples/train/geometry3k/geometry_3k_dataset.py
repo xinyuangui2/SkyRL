@@ -96,6 +96,9 @@ def make_map_fn(split):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_dir", default="~/data/geometry_3k")
+    parser.add_argument(
+        "--max_train_samples", type=int, default=None, help="Keep only the first N training examples (CI subsets)."
+    )
     args = parser.parse_args()
 
     args.output_dir = os.path.expanduser(args.output_dir)
@@ -106,6 +109,8 @@ if __name__ == "__main__":
     dataset = datasets.load_dataset(data_source)
 
     train_dataset = dataset["train"]
+    if args.max_train_samples is not None:
+        train_dataset = train_dataset.select(range(min(args.max_train_samples, len(train_dataset))))
     print(f"Loaded {len(train_dataset)} training examples")
 
     # Process the dataset

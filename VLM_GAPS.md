@@ -422,6 +422,122 @@ Format: one entry per gap — symptom, where, proposed fix, status.
   visible. Same applies to the SFT path (`sft_config` has no freeze knob either).
 - **Status:** confirmed from source; recipe patched before its first run.
 
+## 33. SFT: `image_url` content parts are treated as text-only
+- **Symptom:** `has_images` checks only `{"type": "image"}` (`sft_trainer.py:513-517`); OpenAI-style
+  `image_url` parts (the format the RL datasets use, e.g. `geometry_3k_dataset.py`) are silently
+  ignored while the Qwen template still emits an image placeholder with no pixels (#18).
+- **Fix:** normalize `image_url` / `video` parts in `_normalize_chat_messages` (`:385-403`).
+- **Status:** open (small; verl, NeMo-RL, ms-swift, prime-rl all accept OpenAI content blocks).
+
+## 34. SFT: mixed text/image rows crash mid-epoch instead of at load
+- **Symptom:** the modality check is in `collate_sft_batch` (`:722-727`); the pretokenized loader admits
+  mixed stores (`pretokenized.py:320-322`). Fix: validate homogeneity after tokenization (`:1132`).
+- **Status:** open (small).
+
+## 35. SFT: last-assistant-turn loss only; no image-token loss mask
+- **Symptom:** `ALL_ASSISTANT_MESSAGES` + images raises (`:518-519`). Loss window is "tokens after the
+  prompt" (`:613`), so an image inside the last assistant turn would be in-loss. Peers (verl, LLaMA-Factory,
+  NeMo-RL, ms-swift, prime-rl, tinker) train on all assistant turns; only ms-swift masks image tokens explicitly.
+- **Fix:** build the mask from per-turn spans via the processor, and zero `image_token_id` positions.
+- **Status:** open (medium; the main SFT feature gap).
+
+## 36. SFT: over-length VLM rows are dropped, never truncated
+- **Symptom:** `:600-604` / `pretokenized.py:247-255`. Peers either truncate image-safely (ms-swift,
+  prime-rl `_find_image_safe_cut`, tinker drops whole image chunks) or filter like SkyRL.
+- **Fix:** right-truncate text only; drop a row only if an image span would be cut.
+- **Status:** open.
+
+## 37. SFT: no processor kwargs (min/max pixels) and the tokenization cache key ignores them
+- **Where:** `get_processor(**tokenizer_kwargs)` (`:922-932`), `_compute_cache_key` (`:175-220`).
+- **Fix:** `processor_kwargs` in SFTConfig, forwarded and hashed. Same knob as the RL P2 item.
+- **Status:** open (small).
+
+## 38. SFT: sequential tokenization, images encoded twice, cache materializes pixels as Python floats
+- **Symptom:** VLM forces `num_workers=0` (`:1096-1098`; the spawn worker takes no processor, `:90-100`);
+  each sample runs the processor twice (prompt `:578`, full `:587`); the cache path round-trips
+  `pixel_values` through `Dataset.from_list` / `to_list()` (`:262,287`, ~30x float32) and the collator
+  re-tensorizes nested lists per batch (`:742`).
+- **Prior art:** tinker-cookbook pickles renderers by name and rebuilds the processor in the worker;
+  NeMo-RL reconstructs from the model path; ms-swift lazy-tokenizes multimodal by default.
+- **Fix:** rebuild the processor in workers from `model.path`; tokenize once; keep VLM rows arrow-backed.
+- **Status:** open (perf; blocks any VLM SFT dataset beyond a few thousand rows).
+
+## 39. SFT: packing is gated on `is_vlm`, not on "rows carry images"; `language_model_only` not exposed
+- **Symptom:** text-only SFT of a VLM checkpoint (e.g. Qwen3.5) loses packing (`:937-941`); `build_skyrl_config_for_sft`
+  does not map `language_model_only` (`sft_config.py:630-700`); `use_sequence_packing=True` + VLM leaves
+  `micro_train_batch_size_per_gpu=1` (`:676`) after packing is flipped off (`:939`).
+- **Fix:** expose `language_model_only` in SFTConfig; gate packing on tokenized rows having `pixel_values`;
+  move the VLM override into `validate_sft_cfg`.
+- **Status:** open.
+
+## 40. SFT + RL: no freeze-vision-tower / vision LR; Megatron LoRA hits the ViT
+- **Symptom:** no config field on either backend; only reachable as undocumented
+  `megatron_config.transformer_config_kwargs.freeze_vision_model=true`. Megatron LoRA `exclude_modules`
+  defaults `[]` (`megatron_worker.py:441`) and the bridge ViT shares `linear_qkv/linear_proj/linear_fc1/fc2`
+  names, so adapters land on the vision tower on both backends (extends #14).
+- **Peers:** freeze flags in 7 frameworks; `vit_lr`/`aligner_lr` in ms-swift; LoRA excludes the tower by
+  default in LLaMA-Factory and prime-rl.
+- **Fix:** `model.freeze_vision_tower` (+ projector) on both backends, default LoRA exclusion for VLMs, and a
+  name filter in `FsdpWeightSource` so a frozen tower is not re-synced.
+- **Status:** open (P2 feature; #32 is the MoE-specific symptom).
+
+## 41. SFT: FSDP VLM SFT is untested and undocumented; CP guard has no test row
+- **Symptom:** wiring exists (`model_wrapper.py:329-403`) but no test or recipe; `sft/overview.mdx:218` says
+  Megatron only. `test_megatron_vlm_unsupported_parallelism_raises` has no `cp=2` row, and `validate_sft_cfg:600`
+  only asserts padding removal for CP, which `setup()` later flips off.
+- **Fix:** parametrize `test_vlm_train` over `strategy=fsdp`; add `run_sft_fsdp_vlm.sh`; reject CP>1 with VLM.
+- **Status:** open (small).
+
+## 42. Tinker SFT: SFT-trainer and Tinker render paths agree on image token counts only at default processor kwargs
+- **Symptom:** SFT uses the HF processor template (inline `<vision_start><image_pad>xN<vision_end>`); Tinker's vLLM
+  render supplies only the `<image_pad>` run and the client supplies the surrounding tokens
+  (`renderer.py:109-118, 163-180`). N matches by construction only when the engine's `mm_processor_kwargs`
+  are default (#28). tinker-cookbook's `image_to_chunk` computes `expected_tokens` from the HF processor
+  (`get_number_of_image_patches // merge_size**2`); the cookbook's generic chat dataset builders never pass an
+  `image_processor`, so multi-turn image SFT there needs a custom dataset (`vlm_classifier` is single-turn).
+- **Fix:** a cross-path parity test (SFT tokenization vs `/render` vs cookbook `image_to_chunk`) on one image set.
+- **Status:** open.
+
+## 43. Qwen3.5 as a full VLM is untested (SkyRL runs it text-only today)
+- **Symptom:** Qwen3.5 checkpoints are unified VL models (`Qwen3_5ForConditionalGeneration`, `vision_config`
+  present). SkyRL's Qwen3.5 support is `language_model_only` via custom LM-only bridges
+  (`megatron/model_bridges.py:92-164`); nothing exercises the full-VL path, although Megatron-Bridge ships
+  `Qwen35VLModelProvider` (freeze defaults `False`) and vLLM 0.30 serves the VL model.
+- **Fix (in this branch):** `examples/train/sft/run_sft_megatron_vlm_qwen3.5.sh` (1 node: Qwen3.5-9B; 2 nodes:
+  35B-A3B with EP=8 or 27B with TP4/PP2). Untested.
+- **Open:** RL with Qwen3.5 as a VLM (the generator's `image_token_id` / `mm_token_type_ids` assumptions,
+  `model_wrapper.py:389-390`, need checking against the Qwen3.5 config); GDN layers + VL forward under PP.
+- **Status:** recipe written, not run.
+
+## 44. Gemma 4 (and any non-Qwen VLM) is blocked by Qwen-shaped multimodal plumbing
+- **Symptom:** vLLM 0.30 registers `Gemma4ForConditionalGeneration` and Megatron-Bridge has
+  `gemma4_vl_bridge/provider`, but SkyRL hard-codes Qwen's layout end to end: `image_grid_thw` in ~60 places
+  across 12 files (`trainer.py`, `sft_trainer.py`, `worker.py`, both model wrappers, `renderer.py`,
+  generators, `pretokenized.py`, `replay_buffer.py`), `mm_token_type_ids` derived from `config.image_token_id`
+  (`model_wrapper.py:389-390`), the `language_model.` prefix (`worker_utils.py:46`), and `decode_mm_kwargs`
+  expecting exactly `pixel_values` + `image_grid_thw` (`renderer.py:51-62`). Gemma 4 has `pixel_values`
+  (+ audio) and no grid tensor.
+- **Fix:** carry multimodal kwargs as an opaque per-sample dict (`mm_kwargs: Dict[str, TensorList]`) from
+  render through `TrainingInputBatch` to `model.forward(**mm_kwargs)`, with per-model position-id handling
+  delegated to HF / the bridge. That is the same refactor #9 and #19 need. Gemma 4 recipes (RL + SFT, 1 and
+  2 nodes) follow once it lands; writing them now would produce scripts that cannot run.
+- **Status:** open (design; prerequisite for Gemma 4, Kimi-VL, InternVL).
+
+## 45. No end-to-end VLM CI job
+- **Symptom:** GPU CI has unit-level VLM tests (`test_vlm_model_wrapper.py`, `test_skyrl_vlm_gym_generator.py`,
+  `test_megatron_vlm_init.py`) but the nightly e2e family (`gpu_e2e_ci*.yaml`) is text-only, so regressions
+  like #23 or #32 are invisible to CI.
+- **Fix (in this branch):** `SkyRL-GPU-E2E-CI-VLM`: `.github/workflows/gpu_e2e_ci_vlm.yaml` ->
+  `ci/anyscale_gpu_e2e_test_vlm.yaml` -> `ci/gpu_e2e_test_run_vlm.sh` -> `tests/train/gpu_e2e_test/geometry3k_colocate.sh`
+  (Qwen3-VL-2B-Instruct, FSDP, 512-sample subset, 8 steps on l4_ci, asserts eval/train accuracy, token count and
+  logprob diff via `get_summary.py`). Thresholds are initial and loose; recalibrate after ~10 nightlies.
+- **Status:** written, not run (needs the `run_gpu_ci`-style Anyscale submission to validate).
+
+## 46. SFT on Megatron: MoE VLM provider freeze defaults also apply (see #32)
+- **Symptom:** `run_sft_megatron_vlm.sh` with a Qwen3-VL MoE checkpoint would train only the projector.
+- **Fix:** same explicit `freeze_*=false` overrides; the Qwen3.5 SFT recipe already passes them.
+- **Status:** open (recipe-level mitigation only).
+
 ## Recheck notes (2026-09-25)
 Corrections to the earlier framework comparison: verl's `freeze_vision_tower` is config-only (nothing
 reads it); SkyRL can already reach `limit_mm_per_prompt` / `mm_processor_cache_gb` via
