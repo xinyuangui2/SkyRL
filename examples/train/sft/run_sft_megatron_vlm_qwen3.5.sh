@@ -15,6 +15,11 @@ set -x
 #   NUM_NODES=2 MODEL_NAME=Qwen/Qwen3.5-27B MEGATRON_TP=4 MEGATRON_PP=2 \
 #     bash examples/train/sft/run_sft_megatron_vlm_qwen3.5.sh
 #
+# The freeze_* overrides below are explicit on purpose: Megatron-Bridge's Qwen3-VL MoE provider
+# freezes the language model and vision tower by default, see
+# https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/8e7077c6826d17eb4d4d54e6eb15c5a581eda4c0/src/megatron/bridge/models/qwen_vl/qwen3_vl_provider.py#L272-L274
+# The Qwen3.5 providers default to False, but setting them keeps the recipe safe across model swaps.
+#
 # VLM SFT constraints (enforced by the trainer): no sequence packing / microbatch padding removal,
 # no context or sequence parallelism, last-assistant-message loss only, every sample must carry images.
 # Data: chat `messages` with {"type": "image", "image": <data-uri>} parts; the_cauldron prep below.
