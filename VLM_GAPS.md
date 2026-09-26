@@ -538,6 +538,28 @@ Format: one entry per gap — symptom, where, proposed fix, status.
 - **Fix:** same explicit `freeze_*=false` overrides; the Qwen3.5 SFT recipe already passes them.
 - **Status:** open (recipe-level mitigation only).
 
+## 47. Media transfer: images and pixel tensors round-trip through the client on every hop
+- **Symptom:** an image enters as base64 JSON (`ImageChunk`, `api.py:585`; RL datasets as data URIs), goes to vLLM
+  `/render` as a data URI (`renderer.py:136-146`), comes back as base64 msgpack `pixel_values` (`kwargs_data`,
+  `renderer.py:41-62`), and is **re-sent as `features` on every `generate`** (`remote_inference_client.py:300, 819`).
+  The VLM generator re-renders the full conversation each turn, and `mm_processor_cache_gb=0` (#16) prevents vLLM
+  from returning `kwargs_data=None` on a cache hit, which its render protocol supports. Cost per image per hop is
+  roughly 4-10 MB (1,200 patches x 1,536 values for a 640x480 Qwen3-VL image), x turns x n_samples. Tinker's
+  `ImageAssetPointerChunk.location` is passed through as a URL; there is no asset store, and the reference Tinker
+  SDK has no public upload API either (its server dedups internally).
+- **Peers:** every surveyed framework keeps pixel tensors engine/trainer-side and ships them once per prompt
+  (verl, slime, NeMo-RL, prime-rl, AReaL, ROLL); NeMo-RL shares one processor output across the n repeats
+  (`share_immutable_media`); AReaL caches processor output per rollout group; ROLL down-casts mm features to bf16
+  for Ray transfer; vLLM offers content hashing (`mm_hashes`, `multi_modal_uuids`) so media bytes can be omitted on
+  expected cache hits; SGLang EPD / vLLM EC connectors move vision embeddings instead of pixels.
+- **Proposed fix, in order:** (1) enable the vLLM processor cache and pass `mm_hashes` / `multi_modal_uuids` on
+  `generate` instead of tensors, so pixel tensors never leave the engine; (2) render once per prompt and reuse across
+  turns and n samples (only new env images are rendered); (3) server-side content-addressed dedup for Tinker: hash
+  `ImageChunk` bytes, store once, accept `image_asset_pointer` with `location=asset://<hash>` (client unchanged);
+  (4) ship `pixel_values` to the trainer once per prompt in bf16; (5) later, a vision-embedding cache or encoder
+  disaggregation for multi-image / video workloads.
+- **Status:** open (design).
+
 ## Recheck notes (2026-09-25)
 Corrections to the earlier framework comparison: verl's `freeze_vision_tower` is config-only (nothing
 reads it); SkyRL can already reach `limit_mm_per_prompt` / `mm_processor_cache_gb` via
