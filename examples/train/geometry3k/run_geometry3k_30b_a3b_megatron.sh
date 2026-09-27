@@ -97,6 +97,7 @@ uv run --isolated --extra megatron --with pylatexenc \
   trainer.micro_forward_batch_size_per_gpu=4 \
   trainer.micro_train_batch_size_per_gpu=2 \
   trainer.ckpt_interval=10 \
+  trainer.max_ckpts_to_keep=2 \
   trainer.remove_microbatch_padding=false \
   trainer.max_prompt_length=$MAX_PROMPT_LENGTH \
   generator.sampling_params.max_generate_length=$MAX_RESPONSE_LENGTH \

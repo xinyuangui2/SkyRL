@@ -336,7 +336,8 @@ Format: one entry per gap — symptom, where, proposed fix, status.
 - **Open:** run it; then swap in a harder multimodal-reasoning set (e.g. ViRL39K or MMK12) once the
   pipeline is proven. Check whether `vision_expert_*_parallel_size` needs exposing in
   `megatron_config` for the vision tower under EP.
-- **Status:** recipe written, not yet run (needs a 16-GPU cluster).
+- **Status:** run to completion on 2x8 H100 (Run 3, 2026-09-26): 0.577 -> 0.807 pass@1. Needed TP=4/PP=2 (#49).
+  `vision_expert_*_parallel_size` wasn't needed; the vision tower worked under EP=8 as-is.
 
 ## 25. Tinker: non-colocated and external-inference sampling silently drop images
 - **Symptom:** colocated `sample` forwards raw chunks to the engine client, which renders images
@@ -560,6 +561,43 @@ Format: one entry per gap — symptom, where, proposed fix, status.
   disaggregation for multi-image / video workloads.
 - **Status:** open (design).
 
+## 48. Qwen3-VL-30B-A3B loops under greedy eval; ~25% of eval trajectories hit the 4096-token turn cap
+- **Symptom:** in Run 3, 154/601 eval trajectories at step 0 end with `stop_reason=length` at
+  `max_generate_length=4096`, all with reward 0. None are cut by `max_input_length` (so #15 is fixed). 129/154 stop in
+  turn 1, before any tool call (only 1 capped final turn contains a `<tool_call>`). 114/154 are degenerate repetition
+  loops (the second half of the turn has under 50% unique lines, e.g. "Let me consider the angle ... But I don't know
+  that." repeated). The 8B Megatron run at the same prompt format (2048 cap) has more capped trajectories (238/601,
+  183 in turn 1) but only 41 loops. Its caps are mostly long genuine reasoning.
+- **Trend:** RL shrinks it. Capped count: 154 (step 0), 142 (20), 132 (40), 66 (64); loops: 114, 99, 107, 45.
+- **Where:** eval sampling is greedy (`eval_sampling_params.temperature=0.0`, `repetition_penalty=1.0`). Train
+  sampling is temperature 1.0, top_p 1.0, top_k -1, min_p 0, repetition_penalty 1.0. Train rollouts aren't
+  dumped, so the train-side loop rate is unknown.
+- **Proposed fix:** not a larger cap, which would only buy longer loops. Options: eval at T=0.6-0.7 with n>1 (which
+  also addresses #12), or `repetition_penalty` about 1.05 for eval, or a prompt/format change that asks for the tool
+  call earlier. Also log per-batch `stop_reason=length` and loop counts for train rollouts.
+- **Status:** open (measured; recipe unchanged).
+
+## 49. Qwen3-VL-30B-A3B at TP=2/PP=1/EP=8 OOMs in the first policy_train step on 80 GB H100s
+- **Symptom:** `torch.OutOfMemoryError` in `forward_backward_mini_batch` -> Megatron `forward_step` -> the logprob
+  computation in `megatron_utils`: "Tried to allocate 5.68 GiB ... 52.68 GiB is allocated by PyTorch", with the
+  sleeping vLLM holding about 6 GiB on the same GPU. nvidia-smi peaked at 76-81 GB on all 16 GPUs. The run had
+  already passed eval (step 0: 0.594), generate (89 s) and fwd logprobs (50 s). W&B `97wwyvrm`, log
+  `/tmp/geo3k_30b_4.log`. The rank-0 shard was 4.67B params.
+- **Where:** recipe default `MEGATRON_TP=2 MEGATRON_PP=1` with `micro_train_batch_size_per_gpu=2` and sequences up to
+  about 10k tokens (fp32 logits over a 151k vocab).
+- **Fix (in this branch):** recipe defaults are now `MEGATRON_TP=4 MEGATRON_PP=2` (DP=2, rank-0 shard 2.15B). This ran
+  64 steps with policy_train peaks of 59.9 / 68.4 GiB (PP stage 0 / 1) and no OOM. Untested alternative:
+  TP=2 with `micro_train_batch_size_per_gpu=1`, which might avoid the PP bubble (policy_train is 58% of step time).
+- **Status:** fixed (recipe).
+
+## 50. `max_ckpts_to_keep=-1` default keeps every checkpoint (4.0 TB for one 30B-A3B run)
+- **Symptom:** Run 3 saved 10 Megatron checkpoints (every 10 steps plus each epoch end) at 406 GB each, 4.0 TB
+  on shared storage. `cleanup_old_checkpoints` runs every save but deletes nothing.
+- **Where:** `config.py:1465` and `sft_config.py:234` default to `max_ckpts_to_keep=-1`. The 30B recipe didn't set it.
+- **Fix (in this branch):** the 30B recipe now sets `trainer.max_ckpts_to_keep=2`. The Run 3 checkpoints are still
+  in `/mnt/cluster_storage/geo3k/ckpts_30b` and weren't deleted.
+- **Status:** mitigated (recipe).
+
 ## Recheck notes (2026-09-25)
 Corrections to the earlier framework comparison: verl's `freeze_vision_tower` is config-only (nothing
 reads it); SkyRL can already reach `limit_mm_per_prompt` / `mm_processor_cache_gb` via
@@ -635,3 +673,52 @@ Short GPU runs on 8xH100 to confirm gaps from the code-reading recheck. W&B proj
 
 Suggested priority: #15 (set `generator.max_input_length` in the recipe, a one-line recipe fix with a direct accuracy impact),
 #14 (default-exclude the vision tower for LoRA), #13 (validation guard), #23 (strip the eos in the VLM generator, a 2-line fix).
+
+## Run 3 summary: Qwen3-VL-30B-A3B Megatron 2x8 H100 (2026-09-26, completed)
+- **Setup:** 2 GPU nodes x 8 H100 80GB (driver 580.178.04, CUDA 13.0) behind a CPU-only Ray head. vllm 0.30.0,
+  torch 2.13.0+cu130, transformers 5.16.1, megatron-bridge 0.7.0+8e7077c6, megatron-core 0.20.0+d476c21b, ray 2.57.0.
+  `run_geometry3k_30b_a3b_megatron.sh` at abcff150 (with the #32 unfreeze), with `MEGATRON_TP=4 MEGATRON_PP=2`
+  (now the default, #49): EP=8, ETP=1, DP=2, 4 vLLM engines x TP=4, bs=128 x n=8, max 4096 tokens/turn,
+  `max_input_length=8192`, full recompute, 4 epochs = 64 steps.
+- **Launch:** `WANDB_ENTITY=sky-posttraining-uc-berkeley LOGGER=wandb NUM_NODES=2 MEGATRON_TP=4 MEGATRON_PP=2
+  DATA_DIR=/mnt/cluster_storage/geo3k/data EXPORT_PATH=/mnt/cluster_storage/geo3k/exports_30b
+  CKPT_PATH=/mnt/cluster_storage/geo3k/ckpts_30b bash examples/train/geometry3k/run_geometry3k_30b_a3b_megatron.sh
+  trainer.log_path=/mnt/cluster_storage/geo3k/logs_30b`
+- **wandb:** https://wandb.ai/sky-posttraining-uc-berkeley/geometry3k/runs/gleghn3l (the earlier TP=2 OOM attempt is
+  `97wwyvrm`).
+- **Result:** the Megatron VLM MoE path works end to end: `Qwen3VLMoEBridge` dispatch, the vision tower under EP=8,
+  multi-node colocated vLLM with images, NCCL weight sync, and checkpointing. The only code change was the startup
+  param-count log. 64 steps completed with exit 0 in 8 h 11 min (11:22 init to 19:33).
+- **Trainable params (rank-0 shard, TP=4/PP=2):** language_model=2009.4M/2009.4M, vision_model=138.1M/138.1M
+  (the projector sits under vision_model). The #32 unfreeze took effect. No frozen-LM steps were run.
+- **Eval pass@1 (601 test, greedy):** 0 **0.577**, 5 0.621, 10 0.641, 15 0.672, 20 0.699, 25 0.697, 30 0.719,
+  35 0.702, 40 0.720, 45 0.734, 50 0.772, 55 0.765, 60 **0.807**, 64 0.797 (+22 pts; the 8B Megatron run went from
+  0.539 to a 0.729 peak over 96 steps). The TP=2 attempt's step 0 was 0.594; the gap is within #12 greedy noise.
+- **Train (16-step epoch means):**
+
+  | epoch | reward | resp len | entropy | logprob abs diff |
+  |---|---|---|---|---|
+  | 1 | 0.622 | 1970 | 0.330 | 0.0215 |
+  | 2 | 0.700 | 1953 | 0.236 | 0.0196 |
+  | 3 | 0.726 | 1791 | 0.144 | 0.0173 |
+  | 4 | 0.757 | 1693 | 0.087 | 0.0165 |
+
+  Entropy collapses steadily (0.366 at step 1, 0.075 at step 61) without hurting eval over 64 steps. That's worth
+  watching on longer runs.
+- **Trainer-vs-vLLM logprob abs diff:** 0.0221 at step 1, falling to about 0.0165. That's about 2x the 8B Megatron value (0.0116).
+  Candidate causes: MoE routing mismatches between Megatron grouped-GEMM experts and vLLM fused MoE at TP=4, or PP=2.
+  It is only logged as a batch aggregate, so no split by turn or length. It falls as entropy falls, consistent with
+  fewer near-tie routing/token decisions. Not investigated further.
+- **Step time (non-checkpoint steps, about 375 s; 8B: about 95 s):** generate 84-88 s (23%), fwd logprobs about 44 s (12%),
+  policy_train about 219 s (58%), sync_weights about 25 s (7%). Eval 162-185 s. Checkpoint save 253-337 s at 406 GB each
+  (#6, #50), so checkpoint steps take 624-708 s.
+- **Peak GPU memory (nvidia-smi every 5 s, node0 / node1):** overall 79.2 / 79.1 GiB, set during generate
+  (colocated vLLM at `gpu_memory_utilization=0.7` plus trainer residue). policy_train 59.9 / 68.4 GiB,
+  fwd logprobs 30.7 / 48.1 GiB, sync_weights 76.3 / 76.6 GiB, checkpoint save 57.4 / 56.0 GiB. The trainer has about 11 GiB of
+  headroom on the heavier PP stage; the binding constraint is colocated vLLM, not the trainer.
+- **#15 check:** 0/601 eval trajectories are cut by `max_input_length` at every eval (steps 0-64), so the 8192 budget
+  fixes it. The remaining `stop_reason=length` count is real 4096-token turns: 154, 153, 152, 159, 142, 135, 120, 136, 132,
+  118, 88, 86, 69, 66. These are mostly greedy repetition loops in turn 1 (#48).
+- **Operational notes:** worker infra logs default to per-node `/tmp/skyrl-logs`, so the new recipe `LOG_PATH`
+  env points them at shared storage. Editing or `git reset`-ing the recipe while it runs makes bash
+  fail at exit ("unexpected EOF", since bash reads scripts lazily); the training itself is unaffected.
