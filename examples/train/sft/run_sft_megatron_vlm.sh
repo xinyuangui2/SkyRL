@@ -24,9 +24,15 @@ set -x
 : "${DATA_DIR:="$HOME/data/cauldron-vlm"}"
 : "${CKPT_DIR:="$HOME/ckpts/skyrl_sft_megatron_vlm"}"
 
+# Smoke-test subset; set NUM_ROWS= (empty) for the full ai2d set (2434 rows).
+: "${NUM_ROWS:=512}"
+# Must be divisible by the data-parallel size (num_gpus / (TP*PP)); 8 works for 4 and 8 GPUs.
+: "${BATCH_SIZE:=8}"
+: "${NUM_GPUS:=4}"
+
 if [ ! -f "$DATA_DIR/train.parquet" ]; then
   echo "=== Generating the_cauldron VLM SFT dataset ==="
-  uv run examples/train/sft/prepare_cauldron_vlm.py --output-dir "$DATA_DIR"
+  uv run examples/train/sft/prepare_cauldron_vlm.py --output-dir "$DATA_DIR" ${NUM_ROWS:+--num-rows "$NUM_ROWS"}
 fi
 
 uv run --isolated --extra megatron \
@@ -38,7 +44,7 @@ uv run --isolated --extra megatron \
     messages_key=messages \
     max_length=4096 \
     num_steps=30 \
-    batch_size=4 \
+    batch_size=$BATCH_SIZE \
     micro_train_batch_size_per_gpu=1 \
     remove_microbatch_padding=false \
     train_on_what=last_assistant_message \
@@ -49,7 +55,7 @@ uv run --isolated --extra megatron \
     optimizer_config.num_warmup_steps=0 \
     optimizer_config.scheduler=constant_with_warmup \
     placement.num_nodes=1 \
-    placement.num_gpus_per_node=4 \
+    placement.num_gpus_per_node=$NUM_GPUS \
     megatron_config.tensor_model_parallel_size=1 \
     megatron_config.pipeline_model_parallel_size=1 \
     megatron_config.context_parallel_size=1 \
