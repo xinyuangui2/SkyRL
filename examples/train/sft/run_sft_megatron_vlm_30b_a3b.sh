@@ -64,6 +64,7 @@ uv run --isolated --extra megatron \
     eval_datasets="['$DATA_DIR']" \
     eval_dataset_splits="['train[-$EVAL_ROWS:]']" \
     eval_interval=$EVAL_INTERVAL \
+    eval_before_train=true \
     messages_key=messages \
     max_length=$MAX_LENGTH \
     num_epochs=$NUM_EPOCHS \
