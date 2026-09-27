@@ -4,8 +4,10 @@ set -x
 #
 # Larger-model counterpart of run_sft_megatron_vlm.sh (Qwen3-VL-2B, 4 GPUs). Parallelism mirrors the
 # validated RL recipe for the same model (examples/train/geometry3k/run_geometry3k_30b_a3b_megatron.sh):
-# TP=4, PP=2, CP=1, EP=8, ETP=1 (DP=2), full activation recompute. TP=2/PP=1 OOMs on 80GB H100s for RL;
-# SFT has no colocated vLLM so it may fit, but start from the layout that is known to run.
+# TP=4, PP=2, CP=1, EP=8, ETP=1 (DP=2), full activation recompute. SFT has no colocated vLLM, so unlike
+# RL the model also fits at MEGATRON_TP=2 MEGATRON_PP=1 (DP=4): measured 69.7 GiB peak on ai2d at
+# max_length=4096 and about 2.1x faster per step (11-12 s vs 24 s). Use it when the data fits; the
+# TP=4/PP=2 default keeps ~10 GiB more headroom for longer samples.
 #
 # Megatron-Bridge's Qwen3VLMoEModelProvider defaults freeze_language_model=True and
 # freeze_vision_model=True (VLM_GAPS.md #32), so the freeze_* overrides below are required; without
@@ -47,8 +49,11 @@ set -x
 : "${EVAL_INTERVAL:=10}"
 : "${LOGGER:=wandb}"
 : "${CKPT_DIR:="$HOME/ckpts/skyrl_sft_megatron_vlm_30b_a3b"}"
-# Megatron checkpoints for this model are about 406 GB each; off by default.
+# Megatron checkpoints for this model are about 406 GB each; off by default. Note that ckpt_interval=0
+# alone does not disable the final save (sft_trainer always writes one when ckpt_path is set,
+# VLM_GAPS.md #53), so an empty ckpt_path is passed in that case.
 : "${CKPT_INTERVAL:=0}"
+if [ "$CKPT_INTERVAL" -le 0 ]; then CKPT_PATH_ARG=""; else CKPT_PATH_ARG="$CKPT_DIR"; fi
 
 if [ ! -f "$DATA_DIR/train.parquet" ]; then
   echo "=== Generating the_cauldron ($CAULDRON_CONFIG) VLM SFT dataset ==="
@@ -93,7 +98,7 @@ uv run --isolated --extra megatron \
     logger=$LOGGER \
     project_name=skyrl_sft \
     run_name="skyrl_sft_megatron_vlm_30b_a3b_tp${MEGATRON_TP}_pp${MEGATRON_PP}_ep${MEGATRON_EP}" \
-    ckpt_path="$CKPT_DIR" \
+    ckpt_path="$CKPT_PATH_ARG" \
     ckpt_interval=$CKPT_INTERVAL \
     max_ckpts_to_keep=1 \
     hf_save_interval=0 \
