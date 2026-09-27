@@ -78,6 +78,11 @@ def get_megatron_optimizer_param_scheduler(
     if getattr(config, "scheduler", "constant_with_warmup") != "constant_with_warmup":
         raise ValueError("Only constant_with_warmup scheduler is supported for Megatron")
 
+    # SFT with num_epochs passes None (steps are resolved after the dataloader is built), which
+    # would override the default above (VLM_GAPS.md #52). Megatron only supports a constant LR here,
+    # so the value just has to be a positive int; FSDP keeps None so non-constant schedules still error.
+    if num_training_steps is None:
+        num_training_steps = int(1e9)
     lr_warmup_steps = config.num_warmup_steps
     if getattr(config, "lr_decay_steps", None) is None:
         lr_decay_steps = num_training_steps

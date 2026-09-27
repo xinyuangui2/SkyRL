@@ -598,6 +598,51 @@ Format: one entry per gap — symptom, where, proposed fix, status.
   in `/mnt/cluster_storage/geo3k/ckpts_30b` and weren't deleted.
 - **Status:** mitigated (recipe).
 
+## 51. VLM SFT tokenization cache never saves for real datasets (Arrow offset overflow)
+- **Symptom:** `_save_to_cache` logs `Failed to save cache ...: offset overflow while concatenating arrays, consider
+  casting input from list<item: list<item: float>> to list<item: large_list<item: float>>`. Every launch then
+  re-tokenizes from scratch. It failed for every dataset of 2178 rows or more (ai2d 2434 and 2178, chart2text 8191). The
+  256-row eval sets save and reload fine, consistent with the 2 GiB 32-bit Arrow offset limit on `pixel_values`
+  stored as nested Python float lists (#38).
+- **Where:** `sft_trainer.py:_save_to_cache` (`Dataset.from_list(tokenized)`, about line 290); the tokenized rows carry pixel
+  tensors as lists of floats.
+- **Cost:** sequential VLM tokenization (#38) at 20-25 ms/row: 49 s for 2434 ai2d rows, 43 s for 2178, 206 s for
+  8192 chart2text rows. It's paid on every launch, including restarts.
+- **Proposed fix:** store `pixel_values` as bf16/fp32 bytes or `large_list` features (explicit `Features`), or cache
+  only token ids plus image references and re-run the image processor lazily in the collator. At minimum, raise the
+  log to an error-level metric so the silent re-tokenization is visible.
+- **Status:** open.
+
+## 52. Megatron SFT with `num_epochs` crashes in the LR scheduler
+- **Symptom:** `megatron_worker.init_model` -> `get_megatron_optimizer_param_scheduler` -> megatron-core
+  `OptimizerParamScheduler.__init__`: `assert self.lr_decay_steps > 0` raises `TypeError: '>' not supported between
+  instances of 'NoneType' and 'int'`, before step 0.
+- **Where:** `sft_trainer.py:979-994` passes `num_training_steps=self.sft_cfg.num_steps`, which is `None` when
+  `num_epochs` sets the length (steps are resolved only after the dataloader is built, `:1903`). The comment there
+  says the worker falls back to its default, but the explicit `None` overrides `num_training_steps=1e9` in
+  `get_megatron_optimizer_param_scheduler`. No shipped recipe hits it today (`run_sft_megatron_apigen_mt.sh` uses
+  `num_steps`), but any user who sets `num_epochs` on Megatron without `max_training_steps` does, and no CI covers
+  that path. The 30B VLM SFT recipe (`num_epochs=2`) hit it on its first launch.
+- **Fix (in this branch):** `get_megatron_optimizer_param_scheduler` maps `None` to `int(1e9)`. Megatron only supports
+  `constant_with_warmup`, so this changes nothing numerically. The guard is deliberately not in `sft_trainer`: FSDP passes
+  the value to transformers `get_scheduler`, where `None` makes cosine/linear fail loudly, and `1e9` would silently turn
+  them constant.
+- **Proposed proper fix:** resolve `num_steps = num_epochs * len(train_dataloader)` (capped by `max_training_steps`)
+  before `init_model`, so both backends get the real count; add an e2e SFT test with `num_epochs` on Megatron.
+- **Footnotes:** `max_training_steps <= num_warmup_steps` (e.g. 5 vs the recipe's 5) fails Megatron's
+  `assert self.lr_warmup_steps < self.lr_decay_steps`. `num_steps` and `num_epochs` can't both be set
+  (`sft_config.py:103`), so `max_training_steps` is the only way to cap an epoch-based run.
+- **Status:** fixed (Megatron guard); proper fix open.
+
+## 53. SFT `ckpt_interval=0` still writes a final checkpoint (406 GB for 30B-A3B)
+- **Symptom:** Run 4B, with "checkpoints off" (`CKPT_INTERVAL=0`), wrote `global_step_70` (406 GB) at the end; the
+  8-step TP=2 probe's final save took 6 min.
+- **Where:** `sft_trainer.py:2133`: the final save runs whenever `ckpt_path` is non-empty, regardless of
+  `ckpt_interval`. `CKPT_DIR=""` can't disable it because the recipe's `: "${CKPT_DIR:=...}"` treats empty as unset.
+- **Fix:** recipe passes an empty `ckpt_path` when `CKPT_INTERVAL=0` (dcf8104d). Proposed: gate the final save on
+  `ckpt_interval > 0` or add an explicit `save_final_ckpt` flag.
+- **Status:** mitigated (recipe).
+
 ## Recheck notes (2026-09-25)
 Corrections to the earlier framework comparison: verl's `freeze_vision_tower` is config-only (nothing
 reads it); SkyRL can already reach `limit_mm_per_prompt` / `mm_processor_cache_gb` via
@@ -722,3 +767,35 @@ Suggested priority: #15 (set `generator.max_input_length` in the recipe, a one-l
 - **Operational notes:** worker infra logs default to per-node `/tmp/skyrl-logs`, so the new recipe `LOG_PATH`
   env points them at shared storage. Editing or `git reset`-ing the recipe while it runs makes bash
   fail at exit ("unexpected EOF", since bash reads scripts lazily); the training itself is unaffected.
+
+## Run 4 summary: VLM SFT on Megatron (2026-09-26/27; B2 interrupted)
+Same cluster and versions as Run 3 (2x8 H100 80GB; vllm 0.30.0, torch 2.13.0+cu130, transformers 5.16.1,
+megatron-bridge 0.7.0+8e7077c6). Project `skyrl_sft`, entity `sky-posttraining-uc-berkeley`. The trainable-param log
+(`MegatronPolicyWorkerBase.init_model`) fires on the SFT path too. It lands in each node's `/tmp/skyrl-logs` infra log,
+not in the driver log.
+- **Run A: Qwen3-VL-2B, `run_sft_megatron_vlm.sh`, 1x8 H100, DP=8** (W&B `g9g6nnaz`). The recipe as-is failed
+  (`batch_size (4) must be divisible by data-parallel size (8)`), so it was run with `batch_size=8`. The recipe also generated full
+  ai2d (2434 rows) instead of a 512-row subset. Both are fixed in 3e8a5f48. Trainable (rank 0): language_model=1720.6M/1720.6M,
+  vision_model=407.0M/407.0M. train/loss: step 1 1.099, 10 0.160, 20 0.033, 30 0.043 (about 0 from step 22; ai2d answers are
+  1-2 tokens). Step 0.6-1.1 s (step 1 8.7 s). Checkpoints are 28 GB: 35 s, 33 s, then 260 s at step 30 (shared-storage
+  contention); HF export 17 s. Peak 26.2 GiB/GPU. Tokenization 49 s for 2434 rows; cache save failed (#51).
+- **Run B: Qwen3-VL-30B-A3B, `run_sft_megatron_vlm_30b_a3b.sh`, 2x8, TP=4/PP=2/EP=8/ETP=1 (DP=2), ai2d** (W&B
+  `47nu8yqe`). The first launch crashed in the scheduler (#52), fixed. It was then restarted once with `eval_before_train=true`
+  (now in the recipe). The `train[:-256]` / `train[-256:]` slices on a local parquet dir work (2178/256). Trainable
+  (rank 0): language_model=2009.4M/2009.4M, vision_model=138.1M/138.1M. 70 steps (2 epochs x 35, batch 64).
+  **Eval loss:** 0 1.584, 10 0.0122, 20 0.0256, 30 0.0215, 40 0.0273, 50 0.0279, 60 0.0171, 70 0.0322. Train loss is about
+  0.0004-0.01 at the end. This is a formatting check only (short answers). Step median 24.1 s (22.8-34.6); eval about 143 s per
+  pass. Peak 51.2 / 52.2 GiB. Tokenization 43 s + 5 s. A 406 GB final checkpoint was written despite checkpoints being off (#53).
+- **TP=2/PP=1/EP=8 probe (ai2d, 8 steps, `max_training_steps=8`)** (W&B `lsitr9yv`): 11.0-12.5 s/step (step 1 47.9 s),
+  about 2.1x faster than TP=4/PP=2, with a peak of 69.3 / 69.7 GiB. SFT doesn't need PP: the RL OOM (#49) was vLLM-bound.
+  (`max_training_steps=5` failed the warmup assert, #52 footnote.)
+- **B2: 30B-A3B on chart2text (8448 rows = 8192 train + 256 eval), TP=4/PP=2 recipe defaults** (W&B `5wf97d37`),
+  run with `ckpt_path=` (#53). **Interrupted at step 80 of 256** (session shutdown, 2026-09-27 00:22). Tokenization:
+  206 s for 8192 rows (1 filtered for length); cache save failed (#51). **Eval loss:** 0 0.997, 10 0.765, 20 0.743,
+  30 0.746, 40 0.736, 50 0.734, 60 0.736, 70 0.742. Train loss at steps 65/70/75 was 0.725/0.750/0.766, so the train/eval gap
+  is about 0 at step 70 (no overfitting within the first epoch; epoch 1 ends at step 128). Most of the gain comes in the first 10 steps; eval
+  plateaus at about 0.735 from step 40. Step median 24.7 s.
+- **Takeaways:** the Megatron VLM SFT path works for dense 2B and MoE 30B-A3B, with the LM and vision tower fully trained.
+  The blockers were a scheduler crash with `num_epochs` (#52) and batch/DP divisibility; the costs are the re-tokenize-every-launch
+  cache failure (#51) and unwanted final checkpoints (#53). Open: B2 to completion (eval at 100-256), and B2 at TP=2/PP=1
+  to confirm it fits with chart2text lengths.
