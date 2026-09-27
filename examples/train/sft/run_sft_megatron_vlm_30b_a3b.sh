@@ -12,16 +12,21 @@ set -x
 # them only the vision projector trains. See
 # https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/8e7077c6826d17eb4d4d54e6eb15c5a581eda4c0/src/megatron/bridge/models/qwen_vl/qwen3_vl_provider.py#L272-L274
 #
-# Data: the_cauldron `ai2d` subset (about 2.4k rows) converted to chat `messages` with
-# {"type": "image", "image": <data-uri>} parts; the last EVAL_ROWS rows are held out for eval loss.
+# Data: the_cauldron `chart2text` subset (27k rows, ~50-word free-form chart descriptions), capped at NUM_ROWS,
+# converted to chat `messages` with {"type": "image", "image": <data-uri>} parts; the last EVAL_ROWS rows are
+# held out for eval loss. chart2text is used instead of `ai2d` because ai2d answers are one or two tokens, so
+# last-assistant-turn loss collapses to ~0 within 20 steps and measures formatting, not learning. Other
+# long-answer subsets: vistext (10k), localized_narratives (200k), mimic_cgd (71k, 2 images per row).
 # VLM SFT constraints (enforced by the trainer): no sequence packing / microbatch padding removal,
 # no context or sequence parallelism, last-assistant-message loss only, every sample must carry images.
 #
-# uv run examples/train/sft/prepare_cauldron_vlm.py --output-dir $HOME/data/cauldron-vlm-ai2d --config ai2d
+# uv run examples/train/sft/prepare_cauldron_vlm.py --output-dir $HOME/data/cauldron-vlm-chart2text --config chart2text --num-rows 8448
 # NUM_NODES=2 bash examples/train/sft/run_sft_megatron_vlm_30b_a3b.sh
 
-: "${DATA_DIR:="$HOME/data/cauldron-vlm-ai2d"}"
-: "${CAULDRON_CONFIG:="ai2d"}"
+: "${CAULDRON_CONFIG:="chart2text"}"
+: "${DATA_DIR:="$HOME/data/cauldron-vlm-$CAULDRON_CONFIG"}"
+# 8192 train + 256 eval rows: 2 epochs = 256 steps at batch 64.
+: "${NUM_ROWS:=8448}"
 : "${EVAL_ROWS:=256}"
 : "${MODEL_NAME:="Qwen/Qwen3-VL-30B-A3B-Instruct"}"
 : "${NUM_NODES:=2}"
@@ -47,7 +52,7 @@ set -x
 
 if [ ! -f "$DATA_DIR/train.parquet" ]; then
   echo "=== Generating the_cauldron ($CAULDRON_CONFIG) VLM SFT dataset ==="
-  uv run examples/train/sft/prepare_cauldron_vlm.py --output-dir "$DATA_DIR" --config "$CAULDRON_CONFIG"
+  uv run examples/train/sft/prepare_cauldron_vlm.py --output-dir "$DATA_DIR" --config "$CAULDRON_CONFIG" ${NUM_ROWS:+--num-rows "$NUM_ROWS"}
 fi
 
 uv run --isolated --extra megatron \
