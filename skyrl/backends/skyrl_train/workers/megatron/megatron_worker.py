@@ -600,6 +600,26 @@ class MegatronWorker:
         if ddp_config is not None:
             for k, v in get_config_as_dict(ddp_config).items():
                 setattr(default_ddp_config, k, v)
+        if getattr(self.provider, "calculate_per_token_loss", False) and default_ddp_config.average_in_collective:
+            # Per-token loss normalization (forced by Megatron-Bridge's Qwen-VL providers under CP)
+            # sums gradients across DP x CP and divides by the global token count in
+            # finalize_model_grads; Megatron's DDP asserts average_in_collective is off for it.
+            logger.info("calculate_per_token_loss is on: setting ddp_config.average_in_collective=False")
+            default_ddp_config.average_in_collective = False
+        if getattr(self.provider, "calculate_per_token_loss", False):
+            aux_coeff = getattr(self.provider, "moe_aux_loss_coeff", 0.0) or 0.0
+            aux_coeff = max(aux_coeff) if isinstance(aux_coeff, (list, tuple)) else aux_coeff
+            if getattr(self.provider, "num_moe_experts", None) and (
+                aux_coeff > 0 or getattr(self.provider, "moe_z_loss_coeff", None)
+            ):
+                # TODO(xgui): in per-token mode the MoE router pre-multiplies its aux / z losses by the
+                # local token count and relies on finalize_model_grads dividing by the global count,
+                # which SkyRL skips (its loss is normalized via the advantages).
+                raise ValueError(
+                    "MoE aux / z losses are not supported with calculate_per_token_loss (forced on by "
+                    "Megatron-Bridge Qwen-VL models when context_parallel_size > 1); set "
+                    "trainer.policy.megatron_config.moe_aux_loss_coeff=0 and leave moe_z_loss_coeff unset."
+                )
         model = self.provider.provide_distributed_model(
             ddp_config=default_ddp_config, wrap_with_ddp=wrap_with_ddp, bf16=bf16
         )
