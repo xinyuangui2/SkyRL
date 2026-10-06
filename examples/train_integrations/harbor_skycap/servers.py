@@ -26,7 +26,7 @@ class SkycapServerActor:
     def __init__(self, settings: Dict[str, Any], record_dir: Optional[str], ttl: float) -> None:
         from skycap import CaptureService
 
-        from .engine import SkyRLEngine
+        from skyrl.backends.skyrl_train.inference_servers.skycap_engine import SkyRLEngine
 
         node_ip = get_node_ip()
         self.service = CaptureService(

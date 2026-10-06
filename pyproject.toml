@@ -217,9 +217,10 @@ miniswe = [
 harbor = [
     "harbor[daytona,modal]",
 ]
-# skycap, capturing each rollout's exact tokens in token mode (examples/train_integrations/harbor_skycap).
+# skycap, capturing each rollout's exact tokens in token mode (examples/train_integrations/harbor_skycap,
+# and the vision-language generator, generator.vision_language_generator=true).
 skycap = [
-    "skycap[tokens]",
+    "skycap[tokens,multimodal]",
 ]
 # Mooncake distributed KV for vLLM: the store connector (MooncakeStoreConnector,
 # KV-cache offloading) and P2P PD transfer (MooncakeConnector). Provides the python

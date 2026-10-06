@@ -24,7 +24,7 @@ from examples.train_integrations.harbor_skycap.compose import (  # noqa: E402
     TrialOutcome,
     compose,
 )
-from examples.train_integrations.harbor_skycap.engine import SkyRLEngine  # noqa: E402
+from skyrl.backends.skyrl_train.inference_servers.skycap_engine import SkyRLEngine  # noqa: E402
 from examples.train_integrations.harbor_skycap.harbor_generator import (
     HarborSkycapGenerator,  # noqa: E402
 )
