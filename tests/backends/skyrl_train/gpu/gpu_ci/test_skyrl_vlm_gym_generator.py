@@ -147,6 +147,8 @@ def get_vlm_test_config(model: str) -> SkyRLTrainConfig:
     cfg.generator.step_wise_trajectories = False
     cfg.generator.apply_overlong_filtering = False
     cfg.generator.vision_language_generator = True
+    # renderers maps Qwen3-VL 4B/8B/30B by name, not 2B.
+    cfg.generator.vision_language_renderer = "qwen3-vl"
     cfg.generator.inference_engine.backend = "vllm"
     cfg.generator.inference_engine.num_engines = 1
     cfg.generator.inference_engine.tensor_parallel_size = TP_SIZE
