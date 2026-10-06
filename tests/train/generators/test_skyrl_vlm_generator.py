@@ -3,7 +3,7 @@ CPU tests for SkyRLVLMGymGenerator.
 
 The generator's skycap server is real; its renderer is skycap's test renderer (characters are tokens,
 and an image ``fake://<name>/<n>`` is ``n`` placeholders whose pixel rows are filled with
-``len(name)``), and the engine is a fake ``/skyrl/v1/generate`` that answers every prompt ``ok``.
+``len(name)``), and the engine is a fake ``/inference/v1/generate`` that answers every prompt ``ok``.
 
 uv run --isolated --extra dev --extra skyrl-train --extra skycap pytest tests/train/generators/test_skyrl_vlm_generator.py -v
 """
@@ -125,7 +125,7 @@ def tokenizer():
 
 
 class FakeEngine:
-    """SkyRL's ``/skyrl/v1/generate``: answers ``ok`` then the stop token, logprob -0.5 per token."""
+    """vLLM's ``/inference/v1/generate`` behind SkyRL's router: answers ``ok`` then the stop token, logprob -0.5 per token."""
 
     def __init__(self) -> None:
         self.requests: List[Dict[str, Any]] = []
@@ -134,7 +134,7 @@ class FakeEngine:
 
     def app(self) -> web.Application:
         app = web.Application(client_max_size=1024**3)
-        app.router.add_post("/skyrl/v1/generate", self.generate)
+        app.router.add_post("/inference/v1/generate", self.generate)
         app.router.add_post("/finish_session", self.finish_session)
         return app
 
@@ -154,7 +154,7 @@ class FakeEngine:
 class FakeRendererGenerator(SkyRLVLMGymGenerator):
     def _capture_options(self) -> Dict[str, Any]:
         self.renderer = fake.FakeRenderer()
-        return dict(renderer=self.renderer, engine=SkyRLEngine())
+        return dict(renderer=self.renderer, engine=SkyRLEngine(packed_side_channels=False))
 
 
 @pytest_asyncio.fixture
@@ -390,6 +390,17 @@ async def test_vlm_chat_template_kwargs_and_processor_kwargs_reach_the_renderer(
     assert options["chat_template_kwargs"] == {"enable_thinking": False}
     assert options["processor_kwargs"] == {"max_pixels": 1024}
     assert isinstance(options["engine"], SkyRLEngine)
+    assert options["engine"].generate_path == "/inference/v1/generate"
+
+
+def test_the_packed_skyrl_route_refuses_images_it_would_drop():
+    from skycap.tokens.engine import EngineError
+
+    common = dict(prompt_ids=[1, 2], sampling={}, model=None, cache_salt=None, sampling_mask=False)
+    features = {"mm_hashes": {"image": ["a"]}}
+    with pytest.raises(EngineError, match="drops multimodal features"):
+        SkyRLEngine().request(features=features, **common)
+    assert SkyRLEngine(packed_side_channels=False).request(features=features, **common)["features"] == features
 
 
 @pytest.mark.asyncio

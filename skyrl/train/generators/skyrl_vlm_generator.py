@@ -104,7 +104,8 @@ class SkyRLVLMGymGenerator(SkyRLGymGenerator):
             renderer_name=self.generator_cfg.vision_language_renderer,
             chat_template_kwargs=self.generator_cfg.chat_template_kwargs or None,
             processor_kwargs=engine_kwargs.get("mm_processor_kwargs"),
-            engine=SkyRLEngine(),
+            # /skyrl/v1/generate drops images; VLM runs need no packed side channels (no R3, no sample support).
+            engine=SkyRLEngine(packed_side_channels=False),
         )
 
     def _validate_cfg(self, generator_cfg: GeneratorConfig):
