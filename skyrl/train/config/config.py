@@ -1392,9 +1392,14 @@ class GeneratorConfig(BaseConfig):
     trajectory. Advantages are computed from the last step of each trajectory and propagated to the previous steps. See
     https://docs.skyrl.ai/docs/tutorials/step-wise-training"""
     vision_language_generator: bool = False
-    """If True, use SkyRLVLMGymGenerator (multi-modal text+image rollouts). The prompt and each
-    observation are rendered through the inference server's ``/v1/chat/completions/render`` and
-    rollouts stay token-in-token-out."""
+    """If True, use SkyRLVLMGymGenerator (multi-modal text+image rollouts). Rollouts are captured
+    token-in-token-out by skycap, which renders each turn and its images with the model's
+    ``renderers`` renderer (needs the ``skycap`` extra). The image processor takes
+    ``inference_engine.engine_init_kwargs.mm_processor_kwargs``, as the engine does."""
+    vision_language_renderer: Optional[str] = None
+    """The ``renderers`` renderer the vision-language generator renders with, e.g. ``qwen3-vl`` or
+    ``qwen3.5``. By default it is looked up from the model's Hugging Face name, which finds only
+    the names the library lists; set it for a local checkpoint, a fine-tune or an unlisted size."""
     merge_stepwise_output: bool = False
     """When True (and step_wise_trajectories is True), apply prefix-aware merging
     to collapse multi-turn step-wise sequences into single sequences before training."""

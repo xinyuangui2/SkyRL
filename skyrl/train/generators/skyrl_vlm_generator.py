@@ -6,18 +6,14 @@ import copy
 import time
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Tuple
-from uuid import uuid4
 
+import aiohttp
+import numpy as np
 import torch
 from loguru import logger
 
 import skyrl_gym
-from skyrl.backends.renderer import decode_mm_kwargs
-from skyrl.backends.skyrl_train.inference_servers.base import (
-    ConversationType,
-    InferenceEngineInput,
-    MultiModalFeatures,
-)
+from skyrl.backends.skyrl_train.inference_servers.base import ConversationType
 from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
     RemoteInferenceClient,
 )
@@ -32,21 +28,38 @@ from skyrl.train.generators.skyrl_gym_generator import (
     SkyRLGymGenerator,
     TrajectoryOutput,
 )
-from skyrl.train.generators.vlm_chat_renderer import (
-    VLLMChatRenderer,
-    append_mm_features,
-    shift_mm_features,
-    truncate_mm_features,
+
+#: Engine sampling params a chat request to skycap carries. The rest are fixed by token-in/token-out
+#: capture (``logprobs``: the sampled token's are always captured) or don't apply to token ids
+#: (``skip_special_tokens``, ``include_stop_str_in_output``).
+CHAT_SAMPLING_KEYS = (
+    "max_tokens",
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "min_tokens",
+    "seed",
+    "stop",
+    "repetition_penalty",
+    "frequency_penalty",
+    "presence_penalty",
 )
+IGNORED_SAMPLING_KEYS = frozenset({"logprobs", "skip_special_tokens", "include_stop_str_in_output"})
+
+#: skycap's error code for a prompt over the request's ``max_prompt_tokens``.
+CONTEXT_LENGTH_EXCEEDED = "context_length_exceeded"
 
 
 class SkyRLVLMGymGenerator(SkyRLGymGenerator):
     """VLM generator that handles multi-modal (text + image) observations.
 
-    The prompt and each observation are rendered through the inference server's
-    ``/v1/chat/completions/render``. The rollout is token-in-token-out: an observation is rendered
-    after a fixed base conversation and only its suffix is appended, with image placeholder offsets
-    shifted into the trajectory. Earlier turns are never re-rendered.
+    Rollouts are captured by skycap in token mode. The generator runs a skycap server in this process,
+    in front of the inference engine, and speaks OpenAI chat to it: each turn sends the conversation so
+    far, images included, and skycap renders it, extends the previous turn's exact prompt and completion
+    tokens with the new messages, and sends the engine those token ids and every image in the prompt.
+    When the trajectory ends, skycap returns its tokens, loss mask, rollout logprobs and images, which
+    become the trajectory's output.
     """
 
     def __init__(
@@ -58,14 +71,41 @@ class SkyRLVLMGymGenerator(SkyRLGymGenerator):
         policy_model_name: Optional[str] = None,
     ):
         super().__init__(generator_cfg, skyrl_gym_cfg, inference_engine_client, tokenizer, policy_model_name)
-        self.renderer = VLLMChatRenderer(
-            client=inference_engine_client,
-            base_conversation=self.base_conversation,
-            eos_token_id=self.tokenizer.eos_token_id,
-            chat_template_kwargs=self.generator_cfg.chat_template_kwargs,
-            model_name=getattr(inference_engine_client, "model_name", None),
+        self.model_name = policy_model_name or getattr(inference_engine_client, "model_name", None)
+        self.capture_url = self._start_capture()
+        logger.info(f"Initialized SkyRLVLMGymGenerator, capturing with skycap at {self.capture_url}")
+
+    def _start_capture(self) -> str:
+        """Start the skycap server this generator's trajectories are captured by. Returns its URL."""
+        from skycap import CaptureService
+
+        self.capture = CaptureService(
+            self.inference_engine_client.get_endpoint_url(),
+            mode="tokens",
+            # Replies are the completion's text, as the engine decodes it: an env parses its own actions
+            # (tool calls included) out of the text, and reasoning stays inline.
+            use_raw_content=True,
+            # Nothing is recorded: a trajectory is dropped once finished, and its samples are what it returned.
+            keep_unrecorded=False,
+            host="127.0.0.1",
+            **self._capture_options(),
         )
-        logger.info("Initialized SkyRLVLMGymGenerator (VLM multi-modal generator)")
+        return self.capture.start()
+
+    def _capture_options(self) -> Dict[str, Any]:
+        """How skycap renders and reaches the engine: the model's ``renderers`` renderer and SkyRL's wire."""
+        from skyrl.backends.skyrl_train.inference_servers.skycap_engine import (
+            SkyRLEngine,
+        )
+
+        engine_kwargs = self.generator_cfg.inference_engine.engine_init_kwargs or {}
+        return dict(
+            tokenizer=self.tokenizer.name_or_path,
+            renderer_name=self.generator_cfg.vision_language_renderer,
+            chat_template_kwargs=self.generator_cfg.chat_template_kwargs or None,
+            processor_kwargs=engine_kwargs.get("mm_processor_kwargs"),
+            engine=SkyRLEngine(),
+        )
 
     def _validate_cfg(self, generator_cfg: GeneratorConfig):
         if generator_cfg.batched:
@@ -80,7 +120,7 @@ class SkyRLVLMGymGenerator(SkyRLGymGenerator):
         if self.custom_chat_template is not None:
             raise ValueError(
                 "SkyRLVLMGymGenerator does not support a custom chat template, got "
-                f"{generator_cfg.chat_template}. The inference server applies the model's chat template."
+                f"{generator_cfg.chat_template}. skycap renders with the model's renderer."
             )
         super()._validate_cfg(generator_cfg)
 
@@ -98,161 +138,188 @@ class SkyRLVLMGymGenerator(SkyRLGymGenerator):
     ) -> TrajectoryOutput:
         """Multi-turn VLM generation loop for a single trajectory.
 
-        Generated tokens are appended as returned by the engine (loss_mask=1, except an appended
-        eos), and each observation's rendered tokens after them (loss_mask=0). Image features
-        accumulate per trajectory and are sent with every generate call. The final observation is
-        dropped from the response, along with its images.
-
-        The per-trajectory ``session_id`` is released via ``finish_session`` on
-        completion, error, or cancellation so session-aware routing policies can
-        free the replica capacity held by the trajectory.
+        Each turn sends the whole conversation to the trajectory's skycap URL, with the turn's prompt
+        bounded by ``max_input_length``; a longer one ends the trajectory with ``stop_reason="length"``.
+        The trajectory is finished with skycap's ``final`` path rule: the path to the last reply, every
+        reply on it trained. Observations after the last reply are never sent, so the final observation
+        and its images are not part of the output.
         """
+        from skycap import CapturePool
+
         agent_loop_start_time = time.monotonic()
         time_splits = {"llm": 0.0, "env": 0.0}
-        session_id = (
-            f"{trajectory_id.instance_id}_{trajectory_id.repetition_id}" if trajectory_id is not None else uuid4().hex
+
+        env_extras["max_turns"] = self.max_turns
+        env_extras = self._setup_env_extras(env_class, env_extras, sampling_params, trajectory_id)
+        env_config = getattr(self.skyrl_gym_cfg, env_class, dict())
+        env = skyrl_gym.make(env_class, env_config=env_config, extras=env_extras)
+
+        # As in SkyRLGymGenerator, `sampling_params` is None when the engine's defaults (the config's) apply.
+        current_sampling_params: dict = (
+            sampling_params if sampling_params is not None else asdict(self.generator_cfg.sampling_params)
         )
-        try:
-            # ── Setup ──────────────────────────────────────────────────────
-            env_extras["max_turns"] = self.max_turns
-            env_extras = self._setup_env_extras(env_class, env_extras, sampling_params, trajectory_id)
-            env_config = getattr(self.skyrl_gym_cfg, env_class, dict())
-            env = skyrl_gym.make(env_class, env_config=env_config, extras=env_extras)
+        get_logprobs = current_sampling_params.get("logprobs", None) is not None
+        request = self._chat_request(sampling_params, max_input_length, cache_salt)
 
-            conversation = copy.deepcopy(prompt)
-            conversation, _ = await self._run_in_executor_if_available(env.init, conversation)
+        conversation = copy.deepcopy(prompt)
+        conversation, _ = await self._run_in_executor_if_available(env.init, conversation)
 
-            rendered_prompt = await self.renderer.render_prompt(conversation)
-            input_ids: List[int] = list(rendered_prompt.token_ids)
-            # Placeholder offsets index into ``input_ids``.
-            mm_features: Optional[MultiModalFeatures] = rendered_prompt.features
-            prompt_length = len(input_ids)
+        meta = {"env_class": env_class}
+        if trajectory_id is not None:
+            meta.update(instance_id=str(trajectory_id.instance_id), repetition_id=trajectory_id.repetition_id)
+        # Rewards of the turns that generated, in order: the i-th goes on the last token of the i-th reply.
+        turn_rewards: List[float] = []
+        stop_reason = "stop"
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as http:
+            async with CapturePool([self.capture_url]) as pool:
+                async with pool.trajectory(meta, paths="final") as trajectory:
+                    url = f"{trajectory.base_url}/chat/completions"
+                    done = False
+                    while not done:
+                        llm_call_start_time = time.monotonic()
+                        reply = await self._chat(http, url, {**request, "messages": conversation})
+                        time_splits["llm"] += time.monotonic() - llm_call_start_time
+                        if reply is None:
+                            stop_reason = "length"
+                            break
+                        choice = reply["choices"][0]
+                        stop_reason = choice["finish_reason"]
+                        message = choice["message"]
 
-            # As in SkyRLGymGenerator, `sampling_params` is passed to the engine as is (None means the
-            # engine's defaults, which come from the config), so read stop/logprobs from the config.
-            current_sampling_params: dict = (
-                sampling_params if sampling_params is not None else asdict(self.generator_cfg.sampling_params)
+                        env_step_start_time = time.monotonic()
+                        env_step_output = await self._run_in_executor_if_available(env.step, message["content"])
+                        time_splits["env"] += time.monotonic() - env_step_start_time
+                        turn_rewards.append(env_step_output["reward"])
+                        done = env_step_output["done"]
+                        conversation = [*conversation, _replayed(message), *env_step_output["observations"]]
+                    finished = await trajectory.finish()
+
+        env_metrics = env.get_metrics()
+        await self._run_in_executor_if_available(env.close)
+        if not turn_rewards:
+            raise ValueError(
+                f"trajectory {trajectory_id}: the prompt is longer than max_input_length={max_input_length} tokens"
             )
-            stop_strs = current_sampling_params.get("stop", None)
-            get_logprobs = current_sampling_params.get("logprobs", None) is not None
-
-            # ── Accumulators (over ``input_ids[prompt_length:]``) ──────────
-            loss_mask: List[int] = []
-            rollout_logprobs: Optional[List[float]] = [] if get_logprobs else None
-            # (reward, index into the response of the turn's last generated token)
-            per_step_rewards: List[Tuple[float, int]] = []
-            response_length = 0
-            stop_reason = "stop"
-            done = False
-
-            # ── Main loop ─────────────────────────────────────────────────
-            while not done:
-                if len(input_ids) > max_input_length:
-                    stop_reason = "length"
-                    break
-
-                # 1. Generate
-                engine_input = InferenceEngineInput(
-                    prompt_token_ids=[input_ids],
-                    session_ids=[session_id],
-                    sampling_params=sampling_params,
-                    mm_features=[mm_features] if mm_features is not None else None,
-                    cache_salt=cache_salt,
-                )
-                llm_call_start_time = time.monotonic()
-                engine_output = await self.inference_engine_client.generate(engine_input, model=self.policy_model_name)
-                time_splits["llm"] += time.monotonic() - llm_call_start_time
-
-                gen_text = engine_output["responses"][0]
-                gen_ids = list(engine_output["response_ids"][0])
-                stop_reason = engine_output["stop_reasons"][0]
-                gen_logprobs = engine_output["response_logprobs"][0] if engine_output.get("response_logprobs") else None
-
-                # 1b. Append eos when sampling_params.stop is not None
-                added_eos = False
-                if stop_strs is not None and self.generator_cfg.append_eos_token_after_stop_str_in_multi_turn:
-                    if gen_text.endswith(tuple(stop_strs)) and gen_ids[-1] != self.tokenizer.eos_token_id:
-                        gen_ids.append(self.tokenizer.eos_token_id)
-                        if gen_logprobs is not None:
-                            gen_logprobs.append(0.0)
-                        added_eos = True
-
-                # 2. Environment step
-                env_step_start_time = time.monotonic()
-                env_step_output = await self._run_in_executor_if_available(env.step, gen_text)
-                time_splits["env"] += time.monotonic() - env_step_start_time
-                new_obs = env_step_output["observations"]
-                step_reward: float = env_step_output["reward"]
-                done = env_step_output["done"]
-
-                # 3. Render the observation after a fixed base and append its tokens and images.
-                obs = await self.renderer.render_observation(new_obs, done)
-                obs_start = len(input_ids) + len(gen_ids)
-                if obs.features is not None:
-                    mm_features = append_mm_features(mm_features, shift_mm_features(obs.features, obs_start))
-                input_ids += gen_ids + obs.token_ids
-                loss_mask += ([1] * (len(gen_ids) - 1) + [0] if added_eos else [1] * len(gen_ids)) + [0] * len(
-                    obs.token_ids
-                )
-                if rollout_logprobs is not None:
-                    rollout_logprobs += (gen_logprobs if gen_logprobs else [0.0] * len(gen_ids)) + [0.0] * len(
-                        obs.token_ids
-                    )
-                # The response ends after the last generated tokens; the final observation is dropped.
-                response_length = obs_start - prompt_length
-                if gen_ids:
-                    per_step_rewards.append((step_reward, response_length - 1))
-
-            # ── Build outputs ─────────────────────────────────────────────
-            prompt_ids = input_ids[:prompt_length]
-            response_ids = input_ids[prompt_length : prompt_length + response_length]
-            loss_mask = loss_mask[:response_length]
-            if rollout_logprobs is not None:
-                rollout_logprobs = rollout_logprobs[:response_length]
-            reward_out = self._build_per_token_rewards(per_step_rewards, response_ids, appended_eos_token=False)
-            pixel_values, image_grid_thw = self._decode_vision_features(mm_features, prompt_length + response_length)
-
-            # ── Cleanup ───────────────────────────────────────────────────
-            env_metrics = env.get_metrics()
-            await self._run_in_executor_if_available(env.close)
-
-            agent_loop_output = TrajectoryOutput(
-                response_ids=response_ids,
-                reward=reward_out,
-                stop_reason=stop_reason,
-                loss_mask=loss_mask,
-                prompt_ids=prompt_ids,
-                rollout_logprobs=rollout_logprobs,
-                env_metrics=env_metrics,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
+        if finished.status != "finished" or len(finished.samples) != 1:
+            raise RuntimeError(
+                f"skycap could not capture trajectory {trajectory_id} exactly: status {finished.status!r}, "
+                f"{len(finished.samples)} samples"
             )
-            agent_loop_output = self._post_process_agent_loop_output(agent_loop_output, env_extras, trajectory_id)
-            agent_loop_output.e2e_time = time.monotonic() - agent_loop_start_time
-            agent_loop_output.time_splits = time_splits
-            return agent_loop_output
+        (sample,) = finished.samples
+        prompt_ids, response_ids, loss_mask, rollout_logprobs, reply_ends = _split_sample(sample)
+        if len(reply_ends) != len(turn_rewards):
+            raise RuntimeError(
+                f"trajectory {trajectory_id}: {len(turn_rewards)} turns generated, but the captured path has "
+                f"{len(reply_ends)} replies"
+            )
+        reward_out = self._build_per_token_rewards(
+            list(zip(turn_rewards, reply_ends)), response_ids, appended_eos_token=False
+        )
+        pixel_values, image_grid_thw = _vision_features(sample.media)
 
-        finally:
-            await self.inference_engine_client.finish_session(session_id)
+        agent_loop_output = TrajectoryOutput(
+            response_ids=response_ids,
+            reward=reward_out,
+            stop_reason=stop_reason,
+            loss_mask=loss_mask,
+            prompt_ids=prompt_ids,
+            rollout_logprobs=rollout_logprobs if get_logprobs else None,
+            env_metrics=env_metrics,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+        )
+        agent_loop_output = self._post_process_agent_loop_output(agent_loop_output, env_extras, trajectory_id)
+        agent_loop_output.e2e_time = time.monotonic() - agent_loop_start_time
+        agent_loop_output.time_splits = time_splits
+        return agent_loop_output
+
+    def _chat_request(
+        self, sampling_params: Optional[Dict[str, Any]], max_input_length: int, cache_salt: Optional[str]
+    ) -> Dict[str, Any]:
+        """The chat request body every turn of a trajectory shares, all but its messages.
+
+        ``sampling_params`` are the engine's (``get_sampling_params_for_backend``), or None for the
+        config's.
+        """
+        if sampling_params is None:
+            from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
+                get_sampling_params_for_backend,
+            )
+
+            sampling_params = get_sampling_params_for_backend(
+                self.generator_cfg.inference_engine.backend, self.generator_cfg.sampling_params
+            )
+        unsupported = set(sampling_params) - set(CHAT_SAMPLING_KEYS) - IGNORED_SAMPLING_KEYS
+        unsupported = {key for key in unsupported if sampling_params[key] is not None}
+        if unsupported:
+            raise ValueError(f"SkyRLVLMGymGenerator cannot send sampling params {sorted(unsupported)} through skycap")
+        if sampling_params.get("n", 1) != 1:
+            raise ValueError("n > 1 is not supported. Use `config.generator.n_samples_per_prompt` instead.")
+        request: Dict[str, Any] = {
+            key: sampling_params[key] for key in CHAT_SAMPLING_KEYS if sampling_params.get(key) is not None
+        }
+        request["model"] = self.model_name
+        request["max_prompt_tokens"] = max_input_length
+        if cache_salt is not None:
+            request["cache_salt"] = cache_salt
+        return request
 
     @staticmethod
-    def _decode_vision_features(
-        mm_features: Optional[MultiModalFeatures], num_tokens: int
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Decode the image tensors for the images whose placeholders lie in the first ``num_tokens``.
-
-        Images in the dropped final observation are left out, so the tensors match the placeholder
-        tokens in ``prompt_ids + response_ids``. They are decoded from the same serialized items that
-        were sent to the inference engine. Returns ``(None, None)`` without images.
-        """
-        kept = truncate_mm_features(mm_features, num_tokens)
-        if kept is None:
-            return None, None
-        mm_kwargs = decode_mm_kwargs(kept.get("kwargs_data"))
-        return mm_kwargs["pixel_values"], mm_kwargs["image_grid_thw"]
+    async def _chat(http: aiohttp.ClientSession, url: str, body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """One chat completion, or None when the prompt is over ``max_prompt_tokens``."""
+        async with http.post(url, json=body) as response:
+            payload = await response.json(content_type=None)
+            if response.status == 200:
+                return payload
+        error = payload.get("error") if isinstance(payload, dict) else None
+        if response.status == 400 and isinstance(error, dict) and error.get("code") == CONTEXT_LENGTH_EXCEEDED:
+            return None
+        raise RuntimeError(f"skycap chat completion failed: HTTP {response.status}: {payload}")
 
     async def generate_batched(self, *args, **kwargs) -> GeneratorOutput:
         raise NotImplementedError(
             "SkyRLVLMGymGenerator does not support batched generation. "
             "Use the default async agent_loop path instead."
         )
+
+
+def _replayed(message: Dict[str, Any]) -> Dict[str, Any]:
+    """The reply as the next turn sends it back: the fields skycap answered with, ``None``s dropped."""
+    return {key: value for key, value in message.items() if value is not None}
+
+
+def _split_sample(sample: Any) -> Tuple[List[int], List[int], List[int], List[float], List[int]]:
+    """A captured path as ``(prompt_ids, response_ids, loss_mask, rollout_logprobs, reply_ends)``.
+
+    The response starts at the first sampled token, as in ``SkyRLGymGenerator``: the first reply's
+    generation prompt is part of the prompt. ``reply_ends`` are the response indices of each reply's
+    last sampled token. Replies are runs of trained tokens, separated by the observations and template
+    scaffold between them.
+    """
+    loss_mask = list(sample.loss_mask)
+    if 1 not in loss_mask:
+        raise RuntimeError("the captured path has no sampled tokens")
+    start = loss_mask.index(1)
+    response_mask = loss_mask[start:]
+    reply_ends = [
+        i for i, bit in enumerate(response_mask) if bit and (i + 1 == len(response_mask) or not response_mask[i + 1])
+    ]
+    return (
+        list(sample.input_ids[:start]),
+        list(sample.input_ids[start:]),
+        response_mask,
+        list(sample.logprobs[start:]),
+        reply_ends,
+    )
+
+
+def _vision_features(media: List[Any]) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """The path's images as ``(pixel_values, image_grid_thw)`` in placeholder order, or ``(None, None)``."""
+    images = [item for item in media if item.modality == "image"]
+    if len(images) != len(media):
+        raise ValueError(f"SkyRLVLMGymGenerator supports images only, got {sorted({m.modality for m in media})}")
+    if not images:
+        return None, None
+    pixel_values = torch.from_numpy(np.concatenate([np.asarray(item.data["pixel_values"]) for item in images]))
+    image_grid_thw = torch.from_numpy(np.concatenate([np.asarray(item.data["image_grid_thw"]) for item in images]))
+    return pixel_values, image_grid_thw

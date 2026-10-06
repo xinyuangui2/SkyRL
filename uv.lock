@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12, <3.15"
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'linux'",
@@ -7851,6 +7851,12 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/bb/72/858025a1ea72ffe06586883d11d0f2d898e32c04748514d5fe0d3cf4cd70/renderers-0.1.12.dev10-py3-none-any.whl", hash = "sha256:e4616fa4a757cb3d11878d3c5a0b68b35bc689640c55b44e1e50d9eb356cd026", size = 242517, upload-time = "2026-09-23T22:22:44.026Z" },
 ]
 
+[package.optional-dependencies]
+multimodal = [
+    { name = "pillow" },
+    { name = "transformers", marker = "sys_platform == 'linux' or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-jax') or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-jax' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-miniswe' and extra == 'extra-5-skyrl-tpu')" },
+]
+
 [[package]]
 name = "requests"
 version = "2.34.2"
@@ -8509,6 +8515,10 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+multimodal = [
+    { name = "renderers", extra = ["multimodal"] },
+    { name = "transformers", marker = "sys_platform == 'linux' or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-jax') or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-jax' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-miniswe' and extra == 'extra-5-skyrl-tpu')" },
+]
 tokens = [
     { name = "renderers" },
     { name = "transformers", marker = "sys_platform == 'linux' or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-jax') or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-jax' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-miniswe' and extra == 'extra-5-skyrl-tpu')" },
@@ -8520,10 +8530,12 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.24" },
     { name = "orjson", specifier = ">=3.10" },
     { name = "renderers", marker = "extra == 'tokens'", specifier = ">=0.1.9.dev9" },
+    { name = "renderers", extras = ["multimodal"], marker = "extra == 'multimodal'", specifier = ">=0.1.9.dev9" },
+    { name = "transformers", marker = "extra == 'multimodal'", specifier = ">=4.50" },
     { name = "transformers", marker = "extra == 'tokens'", specifier = ">=4.50" },
     { name = "zstandard", specifier = ">=0.22" },
 ]
-provides-extras = ["tokens"]
+provides-extras = ["tokens", "multimodal"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -8864,7 +8876,7 @@ ray = [
     { name = "ray", extra = ["default"] },
 ]
 skycap = [
-    { name = "skycap", extra = ["tokens"] },
+    { name = "skycap", extra = ["multimodal", "tokens"] },
 ]
 skyrl-train = [
     { name = "accelerate" },
@@ -9049,7 +9061,7 @@ requires-dist = [
     { name = "s5cmd", marker = "sys_platform == 'linux' and extra == 'skyrl-train'", specifier = ">=0.3.3" },
     { name = "safetensors", specifier = ">=0.6.2" },
     { name = "setuptools", marker = "extra == 'skyrl-train'" },
-    { name = "skycap", extras = ["tokens"], marker = "extra == 'skycap'", editable = "skycap" },
+    { name = "skycap", extras = ["multimodal", "tokens"], marker = "extra == 'skycap'", editable = "skycap" },
     { name = "skyrl", extras = ["megatron"], marker = "extra == 'fa4'" },
     { name = "skyrl", extras = ["skyrl-train"], marker = "extra == 'fsdp'" },
     { name = "skyrl", extras = ["skyrl-train"], marker = "extra == 'megatron'" },
