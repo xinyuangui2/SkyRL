@@ -469,14 +469,13 @@ def validate_cfg(cfg: SkyRLTrainConfig):
             "`token_mean_legacy` loss reduction is not supported with step-wise training. Use `token_mean` instead."
         )
 
-    if cfg.generator.step_wise_trajectories and cfg.generator.inference_engine.enable_return_routed_experts:
+    # Step-wise rows may carry routes when each row's routes are its own (see
+    # `_validate_per_token_side_channels`); SkyRLGymGenerator's step-wise mode refuses them itself. Merging
+    # rows into one sequence doesn't carry routes, so refuse that here rather than mid-run.
+    if cfg.generator.merge_stepwise_output and cfg.generator.inference_engine.enable_return_routed_experts:
         raise ValueError(
             "`generator.inference_engine.enable_return_routed_experts=True` is not supported with "
-            "`generator.step_wise_trajectories=True`. Each step-wise row's prompt is the whole history so "
-            "far, while routes are recorded for that step's generated tokens only. The trainer aligns "
-            "routes from the start of the sequence, so a step's routes would replay onto the first N prompt "
-            "tokens of its row with no length mismatch to assert on, silently training against routing that "
-            "does not match the rollout."
+            "`generator.merge_stepwise_output=True`: prefix-aware merging does not merge routed experts."
         )
 
     if cfg.generator.merge_stepwise_output and not cfg.generator.step_wise_trajectories:
@@ -761,9 +760,16 @@ def validate_inference_engine_cfg(cfg: SkyRLTrainConfig):
     assert ie_cfg.distributed_executor_backend in ("mp", "ray"), "invalid distributed executor backend"
 
     if ie_cfg.enable_return_routed_experts:
-        assert (
-            ie_cfg.distributed_executor_backend == "mp"
-        ), "rollout router replay (r3) can hang with the ray backend - use the vLLM mp backend instead"
+        # vLLM captures routes per worker, into a buffer covering only that worker's layers, and
+        # only the last pipeline stage returns model output. With inference PP > 1 the routes of
+        # every earlier stage's MoE layers are silently dropped (left as expert 0). This holds for
+        # both executor backends. The ray backend itself is fine: vLLM copies the routed-expert
+        # arrays out of Ray's shared-memory channel before the next read (v1/executor/ray_utils.py).
+        assert ie_cfg.pipeline_parallel_size == 1, (
+            "rollout router replay (r3) requires generator.inference_engine.pipeline_parallel_size=1: "
+            "vLLM returns routed experts only from the last pipeline stage, so earlier stages' routes "
+            "would be lost. Scale the inference engine with tensor/expert parallelism instead."
+        )
         assert (
             cfg.trainer.strategy == "megatron"
         ), "rollout router replay (r3) is only supported with Megatron training backend"
@@ -900,6 +906,9 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
     """
     # TODO(sumanthrh): introduce a debug mode and add debugging flags like `CUDA_LAUNCH_BLOCKING` here
     env_vars = {}
+    annotation_cfg = cfg.trainer.grafana_annotations
+    if annotation_cfg.enabled and (token := os.environ.get(annotation_cfg.token_env_var)):
+        env_vars[annotation_cfg.token_env_var] = token
 
     # TileLang JITs kernels by shelling out to nvcc, and picks its toolkit from CUDA_HOME,
     # defaulting to the pip wheel tree (site-packages/nvidia/cu13). That tree can be internally
@@ -1052,6 +1061,9 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         "HF_HUB_OFFLINE",
         "HF_ENDPOINT",
         "PYTORCH_CUDA_ALLOC_CONF",
+        # Selects the DSA indexer top-k backend under dsa_kernel_backend=cudnn
+        # (patches/megatron/patch_dsa_hybrid_indexer.py); read in the Megatron workers.
+        "SKYRL_DSA_INDEXER_BACKEND",
         # Debug/trace knobs — forwarded so they reach the worker actors, not just the driver.
         "CUDA_LAUNCH_BLOCKING",
         "PYTHONFAULTHANDLER",
@@ -1060,7 +1072,8 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         "NCCL_DEBUG",
     ):
         if value := os.environ.get(var_name):
-            logger.info(f"Exporting `{var_name}` to ray runtime env: {value}")
+            logged_value = "[REDACTED]" if var_name == "HF_TOKEN" else value
+            logger.info(f"Exporting `{var_name}` to ray runtime env: {logged_value}")
             env_vars[var_name] = value
 
     # Forward any SKYRL_* overrides set in the launching shell (e.g.
