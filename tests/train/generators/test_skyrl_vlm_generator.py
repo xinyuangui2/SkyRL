@@ -267,6 +267,9 @@ async def test_vlm_rollout_is_the_captured_path_token_for_token(tokenizer, engin
     assert sum(rewards) == 6.0
     assert output["stop_reasons"] == ["stop"]
     assert output["rollout_logprobs"] is None
+    # Every call after the first extended the previous one's tokens.
+    metrics = output["rollout_metrics"]
+    assert (metrics["skycap/trajectories"], metrics["skycap/calls"], metrics["skycap/unbridged_calls"]) == (1, 3, 0)
     # One engine session per trajectory, released when it finished.
     assert len(set(engine.sessions)) == 1 and engine.released == [engine.sessions[0]]
 

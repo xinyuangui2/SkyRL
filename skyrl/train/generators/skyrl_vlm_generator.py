@@ -20,6 +20,7 @@ from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import
 from skyrl.train.config import GeneratorConfig, SkyRLGymConfig
 from skyrl.train.generators.base import (
     TRAINING_PHASE_TRAIN,
+    GeneratorInput,
     GeneratorOutput,
     TrainingPhase,
     TrajectoryID,
@@ -73,6 +74,10 @@ class SkyRLVLMGymGenerator(SkyRLGymGenerator):
         super().__init__(generator_cfg, skyrl_gym_cfg, inference_engine_client, tokenizer, policy_model_name)
         self.model_name = policy_model_name or getattr(inference_engine_client, "model_name", None)
         self.capture_url = self._start_capture()
+        #: Running totals since the generator started, reported as ``skycap/*`` rollout metrics. A call is
+        #: unbridged when skycap rendered its prompt from the messages instead of extending the previous
+        #: call's exact tokens; the agent loop's history is append-only, so that stays 0.
+        self.capture_stats = {"trajectories": 0, "calls": 0, "unbridged_calls": 0}
         logger.info(f"Initialized SkyRLVLMGymGenerator, capturing with skycap at {self.capture_url}")
 
     def _start_capture(self) -> str:
@@ -194,6 +199,9 @@ class SkyRLVLMGymGenerator(SkyRLGymGenerator):
                         done = env_step_output["done"]
                         conversation = [*conversation, _replayed(message), *env_step_output["observations"]]
                     finished = await trajectory.finish()
+        self.capture_stats["trajectories"] += 1
+        self.capture_stats["calls"] += len(turn_rewards)
+        self.capture_stats["unbridged_calls"] += finished.unbridged_calls
 
         env_metrics = env.get_metrics()
         await self._run_in_executor_if_available(env.close)
@@ -276,6 +284,11 @@ class SkyRLVLMGymGenerator(SkyRLGymGenerator):
         if response.status == 400 and isinstance(error, dict) and error.get("code") == CONTEXT_LENGTH_EXCEEDED:
             return None
         raise RuntimeError(f"skycap chat completion failed: HTTP {response.status}: {payload}")
+
+    async def generate(self, input_batch: GeneratorInput, disable_tqdm: bool = False) -> GeneratorOutput:
+        output = await super().generate(input_batch, disable_tqdm=disable_tqdm)
+        output["rollout_metrics"].update({f"skycap/{key}": value for key, value in self.capture_stats.items()})
+        return output
 
     async def generate_batched(self, *args, **kwargs) -> GeneratorOutput:
         raise NotImplementedError(
