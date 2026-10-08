@@ -382,12 +382,21 @@ class CaptureServer:
                 return _json({"error": f"trajectory already finished with paths={trajectory.samples['paths']!r}"}, 409)
         elif paths not in self.path_rules:
             return _json({"error": f"`paths` must be one of {sorted(self.path_rules)}"}, 400)
+        recorded = trajectory.id not in self.trajectories
         try:
             samples = await self.end(trajectory, "finished", annotations, paths=paths)
         except Exception as error:  # noqa: BLE001 - a custom rule's failure, reported to the caller
             logger.exception("path rule %r failed on %s", paths, trajectory.id)
             message = f"path rule {paths!r} failed: {type(error).__name__}: {error}"
             return _json({"error": message, "code": PATH_RULE_FAILED}, 500)
+        if recorded and any(item.data is None for sample in samples for item in sample.media):
+            # Answered from the record: a repeat, or the first finish of one the TTL or a shutdown wrote. A
+            # record keeps images' placeholders, not their processed arrays, so there are no complete samples
+            # to give, and the finish answers with none; the caller drops the trajectory.
+            logger.warning(
+                "%s: a finish answered from the record of a trajectory with images has no samples", trajectory.id
+            )
+            samples = []
         return _json(
             {
                 "id": trajectory.id,

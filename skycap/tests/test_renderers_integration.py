@@ -148,10 +148,15 @@ VL_TOKENIZER = "Qwen/Qwen3-VL-2B-Instruct"
 def vl_renderer() -> RenderersRenderer:
     pytest.importorskip("PIL")
     pytest.importorskip("torchvision")
+    from transformers import AutoProcessor
+
+    # Only missing model files skip (transformers raises OSError without network or cache); a broken
+    # renderer or processor setup fails the test.
     try:
-        return RenderersRenderer(VL_TOKENIZER, size=1, renderer="qwen3-vl", processor_kwargs={"max_pixels": 200704})
-    except Exception as error:  # noqa: BLE001 - no network and no cache
+        AutoProcessor.from_pretrained(VL_TOKENIZER)
+    except OSError as error:
         pytest.skip(f"processor unavailable: {error}")
+    return RenderersRenderer(VL_TOKENIZER, size=1, renderer="qwen3-vl", processor_kwargs={"max_pixels": 200704})
 
 
 def _png(color: str, size: tuple[int, int]) -> dict:
@@ -188,3 +193,8 @@ def test_an_image_turn_bridges_to_exactly_the_full_render(vl_renderer: Renderers
     assert [(m.offset, m.length) for m in [*first.media, *bridged.media]] == [(m.offset, m.length) for m in full.media]
     for item in full.media:
         assert full.token_ids[item.offset : item.offset + item.length] == [pad] * item.length
+
+
+def test_processor_kwargs_for_a_text_only_model_are_refused(renderer: RenderersRenderer) -> None:
+    with pytest.raises(ValueError, match="processor_kwargs are for a multimodal model"):
+        RenderersRenderer(TOKENIZER, size=1, processor_kwargs={"max_pixels": 200704})

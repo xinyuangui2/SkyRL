@@ -122,10 +122,7 @@ def _media(data: MultiModalData | None, start: int = 0) -> tuple[Media, ...]:
         return ()
     found = []
     for modality, ranges in data.mm_placeholders.items():
-        hashes = data.mm_hashes.get(modality) or []
-        items = data.mm_items.get(modality) or []
-        if not len(ranges) == len(hashes) == len(items):
-            raise ValueError(f"{modality}: {len(ranges)} placeholders, {len(hashes)} hashes, {len(items)} items")
+        hashes, items = data.mm_hashes.get(modality) or [], data.mm_items.get(modality) or []
         for placeholder, digest, item in zip(ranges, hashes, items, strict=True):
             if placeholder.offset >= start:
                 found.append(Media(modality, placeholder.offset, placeholder.length, digest, item))
@@ -140,8 +137,6 @@ def _multi_modal_data(media: Sequence[Media]) -> MultiModalData | None:
 
     data = MultiModalData()
     for item in media:
-        if item.data is None:
-            raise ValueError(f"{item.modality} item {item.hash} has no processed data")
         data.mm_hashes.setdefault(item.modality, []).append(item.hash)
         data.mm_placeholders.setdefault(item.modality, []).append(PlaceholderRange(item.offset, item.length))
         data.mm_items.setdefault(item.modality, []).append(dict(item.data))
@@ -194,12 +189,12 @@ class RenderersRenderer:
         def build() -> tuple[Any, Any]:
             loaded = load_tokenizer(tokenizer)
             renderer = create_renderer(loaded, config, chat_template_kwargs=chat_template_kwargs)
-            if processor_kwargs and is_multimodal(renderer):
+            if processor_kwargs:
+                if not is_multimodal(renderer):
+                    raise ValueError(f"processor_kwargs are for a multimodal model; {tokenizer} renders text only")
                 from transformers import AutoProcessor
 
                 # A multimodal renderer loads its processor lazily, without kwargs; one given here wins.
-                if not hasattr(renderer, "_processor"):
-                    raise ValueError(f"{type(renderer).__name__} does not take a processor")
                 renderer._processor = AutoProcessor.from_pretrained(tokenizer, **processor_kwargs)
             return renderer, loaded
 
@@ -214,7 +209,9 @@ class RenderersRenderer:
         with self._checkout() as (renderer, _):
             self._stop_ids = [int(t) for t in renderer.get_stop_token_ids()]
             self.multimodal = is_multimodal(renderer)
-        # Keyed by the item at offset 0, so by content: an image is encoded once, not every turn.
+        # An item's encoded vLLM features (its processed arrays) don't depend on where its placeholders
+        # sit; the offset is sent separately, in ``mm_placeholders``. So ``features`` keys this cache by the
+        # item moved to offset 0, which is its content, and an image is encoded once, not every turn.
         self._encode = lru_cache(maxsize=self.ENCODED_CACHE)(self._encode_item)
 
     @contextmanager
@@ -246,8 +243,6 @@ class RenderersRenderer:
         extra: dict[str, Any] = {}
         if self.multimodal:
             extra["previous_multi_modal_data"] = _multi_modal_data(previous_media)
-        elif previous_media:
-            raise ValueError(f"{self.name} renders text only, but the previous turn has media")
         with self._checkout() as (renderer, _):
             out = renderer.bridge_to_next_turn(
                 list(previous_prompt),

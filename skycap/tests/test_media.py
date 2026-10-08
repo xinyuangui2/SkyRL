@@ -180,3 +180,44 @@ def test_an_image_in_no_message_or_across_two_is_refused() -> None:
         attribute_media([Media("image", 13, 3, "a")], 10, chunks)
     with pytest.raises(TokenError, match="in no message"):
         attribute_media([Media("image", 19, 1, "a")], 10, chunks)
+
+
+async def test_a_message_whose_image_changed_is_a_new_node_with_the_new_image() -> None:
+    async with token_stack() as stack:
+        stack.renderer.no_bridge = True
+        created = await stack.create()
+        llm = client(created["base_url"])
+        messages: list[dict[str, Any]] = []
+        await ask(llm, messages, look("what is this?", image("cat", 3)))
+        # The same message, the same placeholder tokens, but the image now processes to other content.
+        stack.renderer.image_salt = "-v2"
+        await ask(llm, messages, user("sure?"))
+        graph = stack.server.trajectories[created["id"]].graph
+
+        assert stack.engine.requests[-1]["features"]["mm_hashes"] == {"image": ["cat-v2"]}
+        assert len(graph.roots()) == 2
+        assert [[m.hash for m in graph.nodes[root].tokens.media] for root in graph.roots()] == [["cat"], ["cat-v2"]]
+        (_, second) = build_samples(graph)
+        assert [item.hash for item in second.media] == ["cat-v2"]
+
+
+async def test_a_repeated_finish_of_a_recorded_trajectory_with_images_returns_no_samples(tmp_path: Path) -> None:
+    async with token_stack(record_dir=tmp_path) as stack:
+        created = await stack.create()
+        llm = client(created["base_url"])
+        await ask(llm, [], look("what is this?", image("cat", 3)))
+        first = await stack.finish(created["id"])
+        repeat = await stack.finish(created["id"])
+
+    assert len(first["samples"]) == 1 and first["samples"][0]["media"][0]["data"] is not None
+    assert repeat["status"] == "finished" and repeat["samples"] == []
+
+
+async def test_a_repeated_finish_of_a_recorded_text_trajectory_still_returns_its_samples(tmp_path: Path) -> None:
+    async with token_stack(record_dir=tmp_path) as stack:
+        created = await stack.create()
+        await ask(client(created["base_url"]), [], user("hi"))
+        first = await stack.finish(created["id"])
+        repeat = await stack.finish(created["id"])
+
+    assert repeat["samples"] == first["samples"] != []
