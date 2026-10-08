@@ -183,7 +183,7 @@ class SkyRLVLMGymGenerator(SkyRLGymGenerator):
                     done = False
                     while not done:
                         llm_call_start_time = time.monotonic()
-                        reply = await self._chat(http, url, {**request, "messages": conversation})
+                        reply = await self._chat(http, url, {**request, "messages": conversation}, trajectory.api_key)
                         time_splits["llm"] += time.monotonic() - llm_call_start_time
                         if reply is None:
                             stop_reason = "length"
@@ -274,9 +274,12 @@ class SkyRLVLMGymGenerator(SkyRLGymGenerator):
         return request
 
     @staticmethod
-    async def _chat(http: aiohttp.ClientSession, url: str, body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    async def _chat(
+        http: aiohttp.ClientSession, url: str, body: Dict[str, Any], api_key: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         """One chat completion, or None when the prompt is over ``max_prompt_tokens``."""
-        async with http.post(url, json=body) as response:
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+        async with http.post(url, json=body, headers=headers) as response:
             payload = await response.json(content_type=None)
             if response.status == 200:
                 return payload
