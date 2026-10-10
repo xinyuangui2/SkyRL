@@ -249,14 +249,32 @@ class RenderersRenderer:
         extra: dict[str, Any] = {}
         if self.multimodal:
             extra["previous_multi_modal_data"] = _multi_modal_data(previous_media)
-        with self._checkout() as (renderer, _):
+        completion = list(previous_completion)
+        with self._checkout() as (renderer, tokenizer):
             out = renderer.bridge_to_next_turn(
-                list(previous_prompt),
-                list(previous_completion),
-                list(new_messages),
-                tools=normalize_tools(tools),
-                **extra,
+                list(previous_prompt), completion, list(new_messages), tools=normalize_tools(tools), **extra
             )
+            # A turn the model ended with its stop token while still thinking (no ``</think>``) is
+            # final as sampled, but the library declines to extend it, and the full render that
+            # follows drops every earlier turn's thinking: the call forks at the first reply, and
+            # so does every call after it until the model closes its thinking again. What follows
+            # a closed turn doesn't depend on what the turn said, so bridge after a stand-in that
+            # only closes the thinking and the turn, and keep the sampled tokens in its place.
+            stand_in = self._closed_stand_in(tokenizer, completion)
+            if out is None and stand_in is not None:
+                out = renderer.bridge_to_next_turn(
+                    list(previous_prompt), stand_in, list(new_messages), tools=normalize_tools(tools), **extra
+                )
+                at = len(previous_prompt) + len(stand_in)
+                if out is None or list(out.token_ids[:at]) != [*previous_prompt, *stand_in]:
+                    return None
+                shift = len(completion) - len(stand_in)
+                return Rendered(
+                    token_ids=[*previous_prompt, *completion, *out.token_ids[at:]],
+                    tail_indices=list(out.message_indices[at:]),
+                    reused=len(previous_prompt) + len(completion),
+                    media=tuple(m.shifted(shift) for m in _media(getattr(out, "multi_modal_data", None), start=at)),
+                )
         if out is None:
             return None
         reused = len(previous_prompt) + len(previous_completion)
@@ -271,6 +289,15 @@ class RenderersRenderer:
             reused=reused,
             media=_media(getattr(out, "multi_modal_data", None), start=reused),
         )
+
+    def _closed_stand_in(self, tokenizer: Any, completion: Sequence[int]) -> list[int] | None:
+        """``</think>`` and the stop token ending ``completion``, if it ended a turn without closing its thinking."""
+        if not completion or completion[-1] not in self._stop_ids:
+            return None
+        think_end = tokenizer.convert_tokens_to_ids("</think>")
+        if not isinstance(think_end, int) or think_end == tokenizer.unk_token_id or think_end in completion:
+            return None
+        return [think_end, completion[-1]]
 
     def features(self, media: Sequence[Media]) -> dict[str, Any]:
         """vLLM's ``features`` for a prompt with these items: hashes, placeholders and encoded items.

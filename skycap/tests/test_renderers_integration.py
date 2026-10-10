@@ -267,3 +267,29 @@ async def test_thinking_opened_by_the_generation_prompt_is_split_and_its_replay_
         exact_prefix = first_request["token_ids"] + completion
         assert second_request["token_ids"][: len(exact_prefix)] == exact_prefix
         assert (await stack.finish(created["id"]))["unbridged_calls"] == 0
+
+
+async def test_a_turn_ended_without_closing_its_thinking_still_bridges(qwen35_renderer: RenderersRenderer) -> None:
+    from renderers.base import load_tokenizer
+
+    tokenizer = load_tokenizer(QWEN35_TOKENIZER)
+    closed = tokenizer.encode("look\n</think>\n\nls\n<|im_end|>", add_special_tokens=False)
+    # The model stopped inside the thinking block: no `</think>` before `<|im_end|>`.
+    still_thinking = tokenizer.encode("cat a.txt\n<|im_end|>", add_special_tokens=False)
+    replies = iter([closed, still_thinking, closed])
+
+    # Raw content, as a text-mode agent like mini-swe-agent replays it: the reasoning stays inline.
+    async with token_stack(completion=lambda prompt, sampling: next(replies), use_raw_content=True) as stack:
+        stack.server.backend.renderer = qwen35_renderer  # type: ignore[attr-defined]
+        created = await stack.create()
+        llm = client(created["base_url"])
+        messages = [user("q")]
+        for observation in ("a.txt", "hello"):
+            response = await llm.chat.completions.create(model="policy", messages=messages)
+            messages += [{"role": "assistant", "content": response.choices[0].message.content}, user(observation)]
+        await llm.chat.completions.create(model="policy", messages=messages)
+
+        second, third = stack.engine.requests[1:]
+        exact_prefix = second["token_ids"] + still_thinking
+        assert third["token_ids"][: len(exact_prefix)] == exact_prefix
+        assert (await stack.finish(created["id"]))["unbridged_calls"] == 0
