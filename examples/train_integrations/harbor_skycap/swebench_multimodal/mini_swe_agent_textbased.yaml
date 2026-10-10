@@ -119,6 +119,11 @@ model:
   # Text-based: the command is parsed out of the reply's text, so skycap answers with the completion as is
   # (skycap.use_raw_content, a thinking model's reasoning inline) and no tool-call parser is involved.
   model_class: litellm_textbased
+  # The command counts only after the thinking closes, as with a reasoning parser, where thinking goes to
+  # reasoning_content and is never searched. mini-swe-agent's default searches the whole raw text, so a
+  # turn that ends still thinking, command included, runs as if it were well formed, and RL then teaches
+  # the policy to stop closing its thinking. Here such a turn is a format error, and so are two commands.
+  action_regex: '</think>(?:(?!```mswea_bash_command).)*```mswea_bash_command\s*\n((?:(?!```).)*?)\n```(?!.*```mswea_bash_command)'
   # mini-swe-agent's default pattern: the image tags prepare_tasks.py writes become image_url parts.
   multimodal_regex: '(?s)<MSWEA_MULTIMODAL_CONTENT><CONTENT_TYPE>(.+?)</CONTENT_TYPE>(.+?)</MSWEA_MULTIMODAL_CONTENT>'
   observation_template: |
@@ -164,6 +169,7 @@ model:
     Here is general guidance on how to format your response:
 
     Please always provide EXACTLY ONE action in triple backticks, found {{actions|length}} actions.
+    Finish your thinking first: the action must come after </think>, not inside your thinking.
 
     Please format your action in triple backticks as shown in <response_example>.
 
