@@ -49,9 +49,11 @@ class RaySandboxEnvironment(BaseEnvironment):
         *args,
         image: str | None = None,
         resources: dict[str, float] | None = None,
-        ttl_seconds: int | None = 3600,
+        ttl_seconds: int | None = 86400,
         shell: str | None = None,
         network: str | None = None,
+        max_concurrency: int = 8,
+        enforce_limits: bool | None = None,
         **kwargs: Any,
     ):
         """
@@ -61,11 +63,21 @@ class RaySandboxEnvironment(BaseEnvironment):
             resources: Extra Ray resources for the sandbox actor, e.g.
                 ``{"sandbox": 0.001}`` to pin sandboxes to nodes labelled with
                 a custom ``sandbox`` resource (and keep them off GPU nodes).
-            ttl_seconds: Wall-clock safety net in case ``stop`` never runs.
+            ttl_seconds: Wall-clock safety net in case ``stop`` never runs. It
+                must outlast the agent and verifier timeouts, which reach 5400 s
+                for SWE-bench tasks. The sandbox also stops when its actor dies.
             shell: Shell for string commands (Ray's default is /bin/bash).
             network: Ray network mode for every trial, e.g. "none" to cut
                 network even for tasks that allow it. Defaults to "none" for
                 no-network tasks and "public" otherwise.
+            max_concurrency: Calls the sandbox actor runs at once, so a
+                long command doesn't hold up the agent's other commands and
+                file transfers.
+            enforce_limits: Whether the task's cpu and memory also become the
+                sandbox's cgroup limits. None (the default) enforces them on
+                nodes that delegate a cgroup v2 subtree to Ray (set
+                ``RAY_SANDBOX_CGROUP_PATH``) and only reserves them elsewhere;
+                True fails a trial on a node without one.
         """
         # Drop provider kwargs from other backends' configs (e.g. Daytona's
         # auto_stop_interval_mins) so the same YAML can be reused.
@@ -78,6 +90,8 @@ class RaySandboxEnvironment(BaseEnvironment):
         self._ttl_seconds = ttl_seconds
         self._shell = shell
         self._network = network
+        self._max_concurrency = max_concurrency
+        self._enforce_limits = enforce_limits
         self._dockerfile_workdir = parse_dockerfile_workdir(
             self.environment_dir / "Dockerfile"
         )
@@ -89,7 +103,8 @@ class RaySandboxEnvironment(BaseEnvironment):
 
     @classmethod
     def resource_capabilities(cls) -> EnvironmentResourceCapabilities:
-        # cpu/memory become both a Ray reservation and a cgroup limit.
+        # cpu/memory become a Ray reservation, and a cgroup limit on nodes that
+        # delegate one to Ray.
         return EnvironmentResourceCapabilities(
             cpu_limit=True, cpu_request=True, memory_limit=True, memory_request=True
         )
@@ -117,13 +132,18 @@ class RaySandboxEnvironment(BaseEnvironment):
     async def start(self, force_build: bool) -> None:
         cpus = float(self._effective_cpus or 1)
         memory_mb = self._effective_memory_mb
-        actor_options = {"num_cpus": cpus, "runtime_env": SANDBOX_RUNTIME_ENV}
+        actor_options = {
+            "num_cpus": cpus,
+            "runtime_env": SANDBOX_RUNTIME_ENV,
+            "max_concurrency": self._max_concurrency,
+        }
         if memory_mb:
             actor_options["memory"] = memory_mb * 1024 * 1024
         if self._resources:
             actor_options["resources"] = self._resources
         self._sb = HarborSandbox.options(**actor_options).remote(
             image=self._image,
+            enforce_limits=self._enforce_limits,
             # The same cpu/memory also become the sandbox's cgroup limits.
             cpu=cpus,
             memory=f"{memory_mb}Mi" if memory_mb else 0,
