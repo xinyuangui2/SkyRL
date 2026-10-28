@@ -67,6 +67,10 @@ from skyrl.backends.skyrl_train.utils.ppo_utils import (
     score_centering_weight,
 )
 from skyrl.backends.skyrl_train.utils.replay_utils import (
+    ReplayMismatchCut,
+    local_replay_token_mask,
+    replay_mismatch_flags_to_batch,
+    replay_mismatch_metrics,
     router_replay_schedule,
     setup_per_microbatch_replay_backward,
     setup_per_microbatch_replay_forward,
@@ -920,6 +924,22 @@ class MegatronModelWrapper:
 
             action_log_probs = token_logprobs[:, -num_actions:]
 
+            # moe_replay_mismatch_cut_overlap: drop the loss positions of tokens whose replayed experts
+            # disagree with their own router; their residual gradients are already cut at every layer.
+            replay_mismatch_flags = data.get("replay_mismatch_flags")
+            replay_mismatch_stats = {}
+            if replay_mismatch_flags is not None:
+                flagged_positions = replay_mismatch_flags_to_batch(replay_mismatch_flags, metadata_layout)
+                dropped = flagged_positions[:, -num_actions:]
+                if loss_mask is None:
+                    loss_mask = torch.ones(dropped.shape, dtype=action_log_probs.dtype, device=dropped.device)
+                replay_mismatch_stats = replay_mismatch_metrics(replay_mismatch_flags)
+                replay_mismatch_stats["replay_mismatch/flagged_tokens"] = float(flagged_positions.sum().item())
+                replay_mismatch_stats["replay_mismatch/dropped_loss_tokens"] = float(
+                    (dropped & (loss_mask > 0)).sum().item()
+                )
+                loss_mask = loss_mask * (~dropped).to(loss_mask.dtype)
+
             # Megatron's canonical positions are next-token predictions, so actions are the last columns.
             action_positions = slice(-num_actions, None)
             centering_inputs = None
@@ -1162,8 +1182,9 @@ class MegatronModelWrapper:
 
             if response_mask is not None:
                 valid_lens = response_mask.sum(dim=1).int().tolist()
-            elif loss_mask is not None:
-                valid_lens = (loss_mask > 0).sum(dim=1).int().tolist()
+            elif data["loss_mask"] is not None:
+                # The unmodified mask: a replay-mismatch drop must not shorten the returned logprobs.
+                valid_lens = (data["loss_mask"] > 0).sum(dim=1).int().tolist()
             else:
                 valid_lens = [seq_len] * batch_size
 
@@ -1185,6 +1206,7 @@ class MegatronModelWrapper:
             }
             if draft_loss is not None:
                 metrics["mtp_loss"] = draft_loss.detach().item()
+            metrics.update(replay_mismatch_stats)
             for k, v in loss_metrics.items():
                 metrics["loss_metrics/" + k] = v
             if centering_inputs is not None:
@@ -1303,6 +1325,12 @@ class MegatronModelWrapper:
                     metadata_layout=metadata_layout,
                     remove_microbatch_padding=self.remove_microbatch_padding,
                 )
+            if replay_mismatch_cut is not None:
+                replay_mismatch_cut.current = None
+                if rollout_expert_indices is not None:
+                    batch["replay_mismatch_flags"] = replay_mismatch_cut.start_microbatch(
+                        local_replay_token_mask(router_padding_mask, metadata_layout)
+                    )
 
             # Recover [batch, seq_len, ...] from Megatron's internal (left-removed) layout. Only used
             # on the non-packed path: with sample packing (remove_microbatch_padding) the logits stay
@@ -1407,7 +1435,13 @@ class MegatronModelWrapper:
             if per_token_loss and not forward_only
             else nullcontext()
         )
-        with router_replay_schedule(replay_enabled), grad_scaling:
+        max_overlap = mcfg.moe_replay_mismatch_cut_overlap
+        replay_mismatch_cut = (
+            ReplayMismatchCut(max_overlap, self.actor_module)
+            if replay_enabled and max_overlap is not None and not forward_only
+            else None
+        )
+        with router_replay_schedule(replay_enabled), grad_scaling, replay_mismatch_cut or nullcontext():
             metrics_list = forward_backward_func(
                 forward_step_func=forward_step,
                 data_iterator=batch_generator,

@@ -551,6 +551,10 @@ class MegatronConfig(BaseConfig):
     moe_enable_routing_replay: bool = False
     """Enable Megatron router replay.
     Used together with ``generator.inference_engine.enable_return_routed_experts`` to enable R3."""
+    moe_replay_mismatch_cut_overlap: Optional[int] = None
+    """Opt-in safeguard for routing replay (requires ``moe_enable_routing_replay`` and PP=1). A token whose replayed
+    top-k shares at most this many experts with its own router's top-k at any MoE layer is dropped from the loss, and
+    its residual-stream gradient is zeroed at every decoder-layer input. Routing is unchanged. ``None`` disables it."""
     moe_per_layer_logging: bool = False
     """Enable per-layer logging of MoE metrics (i.e. per layer aux losses)."""
     moe_router_dtype: str = "fp32"

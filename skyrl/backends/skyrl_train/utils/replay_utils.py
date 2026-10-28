@@ -10,6 +10,7 @@ from skyrl.backends.skyrl_train.distributed.megatron.token_metadata import (
     TokenMetadataLayout,
     align_packed_token_metadata,
     align_token_metadata,
+    scatter_packed_token_values_to_batch,
 )
 from skyrl.backends.skyrl_train.utils.packed_tensor import PackedTensor
 
@@ -292,3 +293,207 @@ def router_replay_schedule(enabled: bool):
         yield
     finally:
         clear_router_replay()
+
+
+class ReplayMismatchFlags:
+    """One microbatch's tokens whose replayed experts disagree with their own router.
+
+    A token is flagged when, at any MoE layer, its replayed top-k shares at most ``max_overlap``
+    experts with the top-k its own router scores pick. Flags live in the router's local token order
+    (``[sequence, batch]`` flattened, sequence-parallel shard). They are only complete once the whole
+    forward has run, so the gradient hooks and the loss read them after the forward.
+    """
+
+    def __init__(self, max_overlap: int, local_valid: torch.Tensor):
+        self.max_overlap = max_overlap
+        # [local tokens] bool, False for padding tokens (their replayed routes are dummies).
+        self.local_valid = local_valid
+        self.flagged = torch.zeros_like(local_valid)
+        self.flagged_token_layers = torch.zeros((), dtype=torch.long, device=local_valid.device)
+        self.overlap_sum = torch.zeros((), dtype=torch.long, device=local_valid.device)
+        self.valid_token_layers = torch.zeros((), dtype=torch.long, device=local_valid.device)
+        self.overlap_min = torch.full((), torch.iinfo(torch.long).max, dtype=torch.long, device=local_valid.device)
+
+    def observe(self, replayed_indices: torch.Tensor, natural_indices: torch.Tensor) -> None:
+        """Record one MoE layer's replayed vs natural top-k (both ``[local tokens, topk]``)."""
+        if replayed_indices.shape[0] != self.flagged.shape[0]:
+            raise ValueError(
+                f"Router saw {replayed_indices.shape[0]} tokens, but the replay mismatch mask holds "
+                f"{self.flagged.shape[0]}"
+            )
+        replayed = replayed_indices.to(natural_indices.device, torch.long)
+        overlap = (replayed[:, :, None] == natural_indices.long()[:, None, :]).any(-1).sum(-1)
+        layer_flagged = (overlap <= self.max_overlap) & self.local_valid
+        self.flagged |= layer_flagged
+        self.flagged_token_layers += layer_flagged.sum()
+        valid_overlap = overlap[self.local_valid]
+        self.overlap_sum += valid_overlap.sum()
+        self.valid_token_layers += valid_overlap.numel()
+        if valid_overlap.numel():
+            self.overlap_min = torch.minimum(self.overlap_min, valid_overlap.min())
+
+    def cut_grad(self, grad: torch.Tensor) -> torch.Tensor:
+        """Zero a ``[sequence, batch, ...]`` hidden-state gradient at flagged tokens."""
+        seq_len, batch_size = grad.shape[0], grad.shape[1]
+        if seq_len * batch_size != self.flagged.numel():
+            raise ValueError(
+                f"Hidden-state gradient {tuple(grad.shape)} does not match {self.flagged.numel()} routed tokens"
+            )
+        keep = (~self.flagged).view(seq_len, batch_size, *([1] * (grad.dim() - 2)))
+        return grad * keep.to(grad.dtype)
+
+
+def local_replay_token_mask(
+    router_padding_mask: torch.Tensor,
+    metadata_layout: TokenMetadataLayout,
+) -> torch.Tensor:
+    """Return this rank's real (non-padding) routed tokens in the router's local token order."""
+    import megatron.core.parallel_state as mpu
+
+    # The router padding mask is True at padding tokens; aligned the same way as the replay indices.
+    aligned_padding = align_token_metadata(router_padding_mask.to(torch.bool), metadata_layout, True)
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+    if tp_size > 1:
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        chunk_size = aligned_padding.shape[1] // tp_size
+        aligned_padding = aligned_padding[:, tp_rank * chunk_size : (tp_rank + 1) * chunk_size]
+    return (~aligned_padding).t().reshape(-1)
+
+
+def replay_mismatch_flags_to_batch(
+    flags: ReplayMismatchFlags,
+    metadata_layout: TokenMetadataLayout,
+) -> torch.Tensor:
+    """Map the microbatch's flags to canonical ``[batch, seq_len - 1]`` next-token loss positions.
+
+    The logit at a token's position scores the next token, so a flagged token drops that position.
+    """
+    import megatron.core.parallel_state as mpu
+
+    if metadata_layout.padded_sequence_lengths is not None:
+        batch_size = 1
+    else:
+        batch_size = metadata_layout.attention_mask.shape[0]
+    local = flags.flagged.view(-1, batch_size)
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+    if tp_size > 1:
+        gathered = torch.empty((local.shape[0] * tp_size, batch_size), dtype=torch.uint8, device=local.device)
+        torch.distributed.all_gather_into_tensor(
+            gathered, local.to(torch.uint8).contiguous(), group=mpu.get_tensor_model_parallel_group()
+        )
+        local = gathered.to(torch.bool)
+    model_flags = local.t().contiguous()  # [batch, aligned seq] (packed: [1, tokens on this CP rank])
+
+    if metadata_layout.padded_sequence_lengths is not None:
+        return scatter_packed_token_values_to_batch(model_flags, metadata_layout, False)
+    if metadata_layout.context_parallel_size > 1:
+        raise ValueError("Replay mismatch cut requires remove_microbatch_padding with context parallelism")
+    attention_mask = metadata_layout.attention_mask
+    batch_flags = torch.zeros(attention_mask.shape, dtype=torch.bool, device=model_flags.device)
+    for row_index, sequence_length in enumerate(metadata_layout.sequence_lengths):
+        batch_flags[row_index, attention_mask[row_index]] = model_flags[row_index, :sequence_length]
+    return batch_flags[:, :-1]
+
+
+def replay_mismatch_metrics(flags: ReplayMismatchFlags) -> dict[str, float]:
+    """Sum the per-rank routing statistics over this microbatch's TP x CP shards."""
+    import megatron.core.parallel_state as mpu
+
+    group = mpu.get_tensor_and_context_parallel_group()
+    sums = torch.stack([flags.flagged_token_layers, flags.overlap_sum, flags.valid_token_layers])
+    overlap_min = flags.overlap_min.clone()
+    if torch.distributed.is_initialized() and group.size() > 1:
+        torch.distributed.all_reduce(sums, group=group)
+        torch.distributed.all_reduce(overlap_min, op=torch.distributed.ReduceOp.MIN, group=group)
+    flagged_token_layers, overlap_sum, valid_token_layers = sums.tolist()
+    metrics = {"replay_mismatch/flagged_token_layers": float(flagged_token_layers)}
+    if valid_token_layers:
+        metrics["replay_mismatch/overlap_mean"] = overlap_sum / valid_token_layers
+        metrics["replay_mismatch/overlap_min"] = float(overlap_min.item())
+    return metrics
+
+
+class ReplayMismatchCut:
+    """Opt-in safeguard against routing-replay mismatch (``moe_replay_mismatch_cut_overlap``).
+
+    With rollout routing replay, a token whose trainer-side hidden state has drifted from the
+    rollout can be forced through experts its own router barely weights, and its gradient can be
+    amplified enough to dominate the update. For every token flagged by ``ReplayMismatchFlags``,
+    this zeroes the residual-stream gradient at every decoder-layer input and (in the loss) drops
+    its loss position. Routing itself is unchanged: flagged tokens still use the replayed experts.
+
+    Active for one training schedule. Requires PP=1, so each microbatch's forward and backward run
+    back to back.
+    """
+
+    _active: "ReplayMismatchCut | None" = None
+
+    def __init__(self, max_overlap: int, model_chunks: list):
+        self.max_overlap = max_overlap
+        self.model_chunks = model_chunks
+        self.current: ReplayMismatchFlags | None = None
+        self._handles = []
+
+    def start_microbatch(self, local_valid: torch.Tensor) -> ReplayMismatchFlags:
+        self.current = ReplayMismatchFlags(self.max_overlap, local_valid)
+        return self.current
+
+    def _cut_layer_input(self, module, args, kwargs):
+        hidden_states = kwargs["hidden_states"] if "hidden_states" in kwargs else args[0]
+        flags = self.current
+        if flags is not None and torch.is_tensor(hidden_states) and hidden_states.requires_grad:
+            hidden_states.register_hook(flags.cut_grad)
+
+    def __enter__(self) -> "ReplayMismatchCut":
+        _patch_router_replay_mismatch_observer()
+        for chunk in self.model_chunks:
+            for layer in _decoder_layers(chunk):
+                self._handles.append(layer.register_forward_pre_hook(self._cut_layer_input, with_kwargs=True))
+        ReplayMismatchCut._active = self
+        return self
+
+    def __exit__(self, *exc) -> None:
+        ReplayMismatchCut._active = None
+        self.current = None
+        for handle in self._handles:
+            handle.remove()
+        self._handles = []
+
+
+def _decoder_layers(model) -> list:
+    from megatron.core.utils import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    for owner in (unwrapped, getattr(unwrapped, "language_model", None)):
+        decoder = getattr(owner, "decoder", None)
+        if decoder is not None and hasattr(decoder, "layers"):
+            return list(decoder.layers)
+    raise ValueError(f"Replay mismatch cut could not find decoder layers on {type(unwrapped).__name__}")
+
+
+def _patch_router_replay_mismatch_observer() -> None:
+    """Wrap ``RouterReplay.get_replay_topk`` so replayed forwards report their natural top-k."""
+    from megatron.core.transformer.moe.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
+
+    if getattr(RouterReplay, "_mismatch_observer_patched", False):
+        return
+    original_get_replay_topk = RouterReplay.get_replay_topk
+
+    def get_replay_topk(self, scores, topk, num_groups=None, group_topk=None, default_compute_topk=None):
+        result = original_get_replay_topk(self, scores, topk, num_groups, group_topk, default_compute_topk)
+        cut = ReplayMismatchCut._active
+        if (
+            cut is not None
+            and cut.current is not None
+            and self.router_replay_action == RouterReplayAction.REPLAY_FORWARD
+        ):
+            with torch.no_grad():
+                _, natural_indices = default_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
+                cut.current.observe(result[1], natural_indices)
+        return result
+
+    RouterReplay.get_replay_topk = get_replay_topk
+    RouterReplay._mismatch_observer_patched = True

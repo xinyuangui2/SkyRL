@@ -279,6 +279,17 @@ def validate_megatron_cfg(cfg: SkyRLTrainConfig):
             cfg.generator.inference_engine.enable_return_routed_experts
         ), "rollout router replay (r3) is only supported when enable_return_routed_experts is True"
 
+    max_overlap = cfg.trainer.policy.megatron_config.moe_replay_mismatch_cut_overlap
+    if max_overlap is not None:
+        assert (
+            cfg.trainer.policy.megatron_config.moe_enable_routing_replay
+        ), "moe_replay_mismatch_cut_overlap requires moe_enable_routing_replay"
+        assert max_overlap >= 0, f"moe_replay_mismatch_cut_overlap must be >= 0, got {max_overlap}"
+        # Flags are complete only after a microbatch's whole forward; with PP > 1 they'd have to cross stages.
+        assert (
+            cfg.trainer.policy.megatron_config.pipeline_model_parallel_size == 1
+        ), "moe_replay_mismatch_cut_overlap requires pipeline_model_parallel_size == 1"
+
     # The decoupled MTP draft loss rolls logits and labels without context parallelism (see the CP=1
     # assert in MegatronModelWrapper), for every model.
     mtp = getattr(cfg.trainer, "mtp", None)
