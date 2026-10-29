@@ -1,12 +1,14 @@
-"""Qwen3.8 QSA sparse attention: the cuDNN frontend kernels against the chunked SDPA path.
+"""Qwen3.8 QSA sparse attention: the cuDNN frontend kernels and FlexAttention against chunked SDPA.
 
 ``qsa_sparse_attention`` runs a pack through cuDNN's ``qsa_forward`` / ``qsa_backward`` on
-Blackwell (NVIDIA/cudnn-frontend#1765). This checks its output and q / k / v gradients against
-the chunked SDPA path on a padded pack mixing sparse-regime sequences (top-512 blocks), short
-dense ones and padding, for 24Q/2KV (TP=1) and 12Q/1KV (TP=2 with sequence parallelism).
+Blackwell (NVIDIA/cudnn-frontend#1765), and otherwise its sparse-regime sequences through
+FlexAttention on CUDA. This checks the output and q / k / v gradients of each against the chunked
+SDPA path on a padded pack mixing sparse-regime sequences (top-512 blocks), short dense ones and
+padding, for 24Q/2KV (TP=1), 12Q/1KV (TP=2 with sequence parallelism) and, for Flex, 6Q/1KV (TP=4,
+which the cuDNN kernels don't cover).
 
-Needs an SM100/SM103 GPU and a cudnn-frontend with ``cudnn.ops.qsa_forward`` (>= 1.32; until it
-is on PyPI, the GitHub dev wheel); skipped otherwise. Run with:
+The cuDNN test needs an SM100/SM103 GPU and a cudnn-frontend with ``cudnn.ops.qsa_forward`` (>= 1.32;
+until it is on PyPI, the GitHub dev wheel); skipped otherwise. The Flex test needs any CUDA GPU. Run with:
 uv run --isolated --extra dev --extra megatron --with <nvidia_cudnn_frontend-1.32*.whl> pytest -s \
     tests/backends/skyrl_train/gpu/gpu_ci/patches/megatron/qwen4_exp/test_qsa_cudnn.py
 """
@@ -51,11 +53,8 @@ def _selection(lengths, pad_to, seed):
     return QSASelection(seqs, R), start
 
 
-@pytest.mark.skipif(not _cudnn_qsa_available(), reason="needs SM100/SM103 and cudnn.ops.qsa_forward")
-@pytest.mark.parametrize("heads", [(24, 2), (12, 1)], ids=["24q2kv", "12q1kv"])
-def test_cudnn_qsa_matches_sdpa(heads, monkeypatch):
-    from skyrl.backends.skyrl_train.patches.megatron.qwen4_exp import modules
-
+def _check_against_sdpa(modules, heads, monkeypatch, name):
+    """Run the pack on the currently enabled path, then on chunked SDPA, and compare."""
     hq, hkv = heads
     selection, total = _selection([5000, 1500, 997, 2600], pad_to=16, seed=0)
     torch.manual_seed(0)
@@ -69,7 +68,6 @@ def test_cudnn_qsa_matches_sdpa(heads, monkeypatch):
         out = modules.qsa_sparse_attention(q, k, v, selection, scale)
         return (out, *torch.autograd.grad(out, (q, k, v), grad))
 
-    assert modules._cudnn_qsa_usable(q, k, v, R)
     got = run()
     monkeypatch.setattr(modules, "_QSA_CUDNN", False)
     monkeypatch.setattr(modules, "_QSA_FLEX", False)
@@ -78,8 +76,29 @@ def test_cudnn_qsa_matches_sdpa(heads, monkeypatch):
     real = torch.zeros(total, dtype=torch.bool, device="cuda")
     for s in selection.sequences:
         real[s.start : s.start + s.length] = True
-    for name, a, b in zip(("out", "dq", "dk", "dv"), got, expected):
+    for label, a, b in zip(("out", "dq", "dk", "dv"), got, expected):
         err = (a.float() - b.float())[real].abs().max().item()
         ref = b.float()[real].abs().max().item()
-        assert err <= 1e-2 * ref, f"{name}: max|cudnn - sdpa| {err:.3g} vs max|sdpa| {ref:.3g}"
-        assert torch.all(a[~real] == 0), f"{name}: nonzero on padding rows"
+        assert err <= 1e-2 * ref, f"{label}: max|{name} - sdpa| {err:.3g} vs max|sdpa| {ref:.3g}"
+        assert torch.all(a[~real] == 0), f"{label}: nonzero on padding rows"
+
+
+@pytest.mark.skipif(not _cudnn_qsa_available(), reason="needs SM100/SM103 and cudnn.ops.qsa_forward")
+@pytest.mark.parametrize("heads", [(24, 2), (12, 1)], ids=["24q2kv", "12q1kv"])
+def test_cudnn_qsa_matches_sdpa(heads, monkeypatch):
+    from skyrl.backends.skyrl_train.patches.megatron.qwen4_exp import modules
+
+    hq, hkv = heads
+    probe = torch.empty(1, hq, D, device="cuda", dtype=torch.bfloat16)
+    assert modules._cudnn_qsa_usable(probe, probe[:, :hkv], probe[:, :hkv], R)
+    _check_against_sdpa(modules, heads, monkeypatch, "cudnn")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
+@pytest.mark.parametrize("heads", [(24, 2), (12, 1), (6, 1)], ids=["24q2kv", "12q1kv", "6q1kv"])
+def test_flex_qsa_matches_sdpa(heads, monkeypatch):
+    from skyrl.backends.skyrl_train.patches.megatron.qwen4_exp import modules
+
+    monkeypatch.setattr(modules, "_QSA_CUDNN", False)
+    monkeypatch.setattr(modules, "_QSA_FLEX", True)
+    _check_against_sdpa(modules, heads, monkeypatch, "flex")
